@@ -3,20 +3,20 @@ package config
 import "testing"
 
 func TestLoadRequiresSetupToken(t *testing.T) {
-	_, err := Load(func(string) string { return "" })
-	if err == nil {
-		t.Fatal("expected error")
+	cfg, err := Load(func(string) string { return "" })
+	if err != nil || cfg.SetupToken != "" || SetupTokenOK("") || !SetupTokenOK("1234567890123456") {
+		t.Fatalf("empty token should wait for admin check: %+v %v", cfg, err)
 	}
-	_, err = Load(func(k string) string {
+	cfg, err = Load(func(k string) string {
 		if k == "SETUP_TOKEN" {
 			return "123456789012345"
 		}
 		return ""
 	})
-	if err == nil {
-		t.Fatal("15 chars should fail")
+	if err != nil || cfg.SetupToken != "123456789012345" || SetupTokenOK(cfg.SetupToken) {
+		t.Fatalf("short token should reach the admin check: %+v %v", cfg, err)
 	}
-	cfg, err := Load(func(k string) string {
+	cfg, err = Load(func(k string) string {
 		if k == "SETUP_TOKEN" {
 			return "1234567890123456"
 		}

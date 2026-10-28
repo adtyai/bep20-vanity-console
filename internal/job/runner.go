@@ -2,6 +2,7 @@ package job
 
 import (
 	"bytes"
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,10 +17,16 @@ type GenerateFunc func() (privHex, checksum, lower string, err error)
 
 type Logger func(event, rule string, id int64, count uint64, errorType string)
 
-var shutdownLimit = 15 * time.Second
+var shutdownLimit = 8 * time.Second
+
+var saveOpenSegment = func(st *store.Store, accumulated time.Duration, segment time.Time) error {
+	return st.SaveOpenSegment(accumulated, segment)
+}
 
 type Snapshot struct {
 	Running   bool
+	Exiting   bool
+	Stoppable bool
 	CPU       int
 	Attempts  uint64
 	PerSecond float64
@@ -39,6 +46,7 @@ type hit struct {
 	checksum string
 	lower    string
 	privHex  string
+	seq      uint64
 }
 
 type event struct {
@@ -53,10 +61,11 @@ type Runner struct {
 	gen   GenerateFunc
 	logf  Logger
 
-	cpu      atomic.Int32
-	running  atomic.Bool
-	exited   atomic.Bool
-	attempts atomic.Uint64
+	cpu       atomic.Int32
+	running   atomic.Bool
+	exited    atomic.Bool
+	abandoned atomic.Bool
+	attempts  atomic.Uint64
 
 	mu           sync.Mutex
 	rules        map[string]bool
@@ -76,11 +85,16 @@ type Runner struct {
 	writerWG   sync.WaitGroup
 	loopOnce   sync.Once
 
-	stateMu   sync.Mutex
-	pendingMu sync.Mutex
-	pending   []hit
-	broken    atomic.Int32
-	save      func([]byte, store.NewResult) (int64, error)
+	stateMu      sync.Mutex
+	persistMu    sync.Mutex
+	pendingMu    sync.Mutex
+	pending      []hit
+	broken       atomic.Int32
+	save         func([]byte, store.NewResult) (int64, error)
+	hitSeq       atomic.Uint64
+	cancelMu     sync.Mutex
+	cancelled    map[string]uint64
+	shutdownOnce sync.Once
 }
 
 type sample struct {
@@ -139,8 +153,9 @@ func (r *Runner) Boot() error {
 		now := time.Now().UTC()
 		r.segmentStart = now
 		r.running.Store(true)
+		acc := r.accumulated
 		r.mu.Unlock()
-		if err := r.store.TouchSegment(now); err != nil {
+		if err := r.store.SaveOpenSegment(acc, now); err != nil {
 			return err
 		}
 	} else {
@@ -181,7 +196,21 @@ func (r *Runner) Start() error {
 
 func (r *Runner) Stop() error {
 	r.stateMu.Lock()
-	if r.exited.Load() || !r.running.Load() {
+	if r.exited.Load() {
+		now := time.Now().UTC()
+		err := r.store.MarkStopped(now)
+		if err != nil {
+			r.stateMu.Unlock()
+			return err
+		}
+		r.running.Store(false)
+		r.mu.Lock()
+		r.segmentStart = time.Time{}
+		r.mu.Unlock()
+		r.stateMu.Unlock()
+		return nil
+	}
+	if !r.running.Load() {
 		r.stateMu.Unlock()
 		return nil
 	}
@@ -207,20 +236,37 @@ func (r *Runner) Stop() error {
 }
 
 func (r *Runner) Shutdown() {
-	r.shutdownWithin(shutdownLimit)
+	r.shutdownOnce.Do(func() {
+		r.shutdownWithin(shutdownLimit)
+	})
 }
 
 func (r *Runner) shutdownWithin(limit time.Duration) {
-	r.stateMu.Lock()
-	r.exited.Store(true)
-	r.running.Store(false)
-	r.stateMu.Unlock()
 	done := make(chan struct{})
 	go func() {
+		r.stateMu.Lock()
+		now := time.Now().UTC()
+		if !r.abandoned.Load() {
+			if err := r.checkpointLocked(now); err != nil {
+				r.logf("error", "", 0, 0, "save")
+			}
+		}
+		if !r.abandoned.Load() {
+			if err := r.detachSegmentLocked(); err != nil {
+				r.logf("error", "", 0, 0, "save")
+			}
+		}
+		r.exited.Store(true)
+		r.running.Store(false)
+		r.stateMu.Unlock()
 		r.waitIdle()
-		r.syncFlush()
+		if !r.abandoned.Load() {
+			r.syncFlush()
+		}
 		r.writerOnce.Do(func() { close(r.writerStop) })
-		r.writerWG.Wait()
+		if !r.abandoned.Load() {
+			r.writerWG.Wait()
+		}
 		close(done)
 	}()
 	timer := time.NewTimer(limit)
@@ -229,6 +275,17 @@ func (r *Runner) shutdownWithin(limit time.Duration) {
 	case <-done:
 	case <-timer.C:
 		r.logf("error", "", 0, 0, "shutdown")
+		r.abandonStore()
+	}
+}
+
+func (r *Runner) abandonStore() {
+	r.abandoned.Store(true)
+	r.pendingMu.Lock()
+	items := append([]hit(nil), r.pending...)
+	r.pendingMu.Unlock()
+	for _, h := range items {
+		r.keepPending(h)
 	}
 }
 
@@ -265,7 +322,9 @@ func (r *Runner) HookSave(fn func([]byte, store.NewResult) (int64, error)) {
 }
 
 func (r *Runner) EnqueueHit(rule string, length int, checksum, lower, priv string) {
-	r.events <- event{hit: &hit{rule: rule, length: length, checksum: checksum, lower: lower, privHex: priv}}
+	h := hit{rule: rule, length: length, checksum: checksum, lower: lower, privHex: priv}
+	r.stamp(&h)
+	r.events <- event{hit: &h}
 	r.syncFlush()
 }
 
@@ -277,6 +336,14 @@ func (r *Runner) Snapshot() Snapshot {
 	observed := time.Since(r.observedAt)
 	r.mu.Unlock()
 	running := r.running.Load()
+	exiting := r.exited.Load()
+	stoppable := running
+	if exiting {
+		stoppable = false
+		if st, err := r.store.Settings(); err == nil {
+			stoppable = st.Running
+		}
+	}
 	runtime := acc
 	if running && !seg.IsZero() {
 		d := time.Since(seg)
@@ -287,6 +354,8 @@ func (r *Runner) Snapshot() Snapshot {
 	per, have, stuck := r.speed(time.Now(), running, observed)
 	return Snapshot{
 		Running:   running,
+		Exiting:   exiting,
+		Stoppable: stoppable,
 		CPU:       int(r.cpu.Load()),
 		Attempts:  r.attempts.Load(),
 		PerSecond: per,
@@ -359,13 +428,19 @@ func (r *Runner) oneKey() {
 	if !ok {
 		return
 	}
-	r.events <- event{hit: &hit{
+	h := hit{
 		rule:     got.Rule,
 		length:   got.Length,
 		checksum: derived,
 		lower:    derivedLower,
 		privHex:  priv,
-	}}
+	}
+	r.stamp(&h)
+	if r.abandoned.Load() {
+		r.keepPending(h)
+		return
+	}
+	r.events <- event{hit: &h}
 }
 
 func (r *Runner) enabled() map[string]bool {
@@ -380,7 +455,9 @@ func (r *Runner) writer() {
 		select {
 		case <-r.writerStop:
 			r.drain()
-			_ = r.store.SetAttempts(r.attempts.Load())
+			if !r.abandoned.Load() {
+				_ = r.store.SetAttempts(r.attempts.Load())
+			}
 			return
 		case ev := <-r.events:
 			r.handle(ev)
@@ -389,15 +466,35 @@ func (r *Runner) writer() {
 }
 
 func (r *Runner) handle(ev event) {
+	if r.abandoned.Load() {
+		if ev.hit != nil {
+			r.keepPending(*ev.hit)
+		}
+		if ev.done != nil {
+			close(ev.done)
+		}
+		return
+	}
 	if ev.hit != nil {
 		r.persistHit(*ev.hit)
+	}
+	if r.abandoned.Load() {
+		if ev.done != nil {
+			close(ev.done)
+		}
+		return
 	}
 	if ev.flushAttempts || ev.done != nil {
 		r.retryPending()
 	}
 	if ev.flushAttempts {
-		if err := r.store.SetAttempts(r.attempts.Load()); err != nil {
+		if err := r.checkpoint(time.Now().UTC()); err != nil {
 			r.logf("error", "", 0, 0, "save")
+		}
+		if !r.abandoned.Load() {
+			if err := r.store.SetAttempts(r.attempts.Load()); err != nil {
+				r.logf("error", "", 0, 0, "save")
+			}
 		}
 	}
 	if ev.done != nil {
@@ -406,13 +503,26 @@ func (r *Runner) handle(ev event) {
 }
 
 func (r *Runner) persistHit(h hit) {
-	_ = writePending(r.store.Dir(), r.key, h)
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	if r.stale(h) {
+		return
+	}
+	if err := writePending(r.store.Dir(), r.key, h); err != nil {
+		r.logf("error", h.rule, 0, 0, "pending")
+	}
+	if r.abandoned.Load() {
+		r.remember(h)
+		return
+	}
 	id, err := r.saveResult(store.NewResult{
 		Rule: h.rule, Length: h.length, Checksum: h.checksum, Lower: h.lower, PrivHex: h.privHex,
 	})
 	if err == nil || alreadyStored(err) {
 		r.forget(h.lower)
-		_ = removePending(r.store.Dir(), h.lower)
+		if rmErr := removePending(r.store.Dir(), h.lower); rmErr != nil {
+			r.logf("error", h.rule, id, 0, "pending")
+		}
 		if err == nil {
 			r.logf("hit", h.rule, id, 1, "")
 		}
@@ -421,6 +531,97 @@ func (r *Runner) persistHit(h hit) {
 	if r.remember(h) {
 		r.logf("error", h.rule, 0, 0, "save")
 	}
+}
+
+func (r *Runner) DeleteResult(id int64) error {
+	rec, err := r.store.Get(id)
+	if err != nil {
+		return err
+	}
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	r.cancel(rec.Lower)
+	if err := removePending(r.store.Dir(), rec.Lower); err != nil {
+		return err
+	}
+	r.forget(rec.Lower)
+	err = r.store.Delete(id)
+	if errors.Is(err, store.ErrScrub) {
+		r.logf("error", "", id, 0, "scrub")
+		return nil
+	}
+	return err
+}
+
+func (r *Runner) ClearBroken() (int, error) {
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	n, err := clearBroken(r.store.Dir(), r.key)
+	_, broken, lerr := loadPending(r.store.Dir(), r.key)
+	if lerr == nil {
+		r.broken.Store(int32(broken))
+	}
+	return n, err
+}
+
+func (r *Runner) keepPending(h hit) {
+	if r.stale(h) {
+		return
+	}
+	if err := writePending(r.store.Dir(), r.key, h); err != nil {
+		if r.stale(h) {
+			return
+		}
+		r.logf("error", h.rule, 0, 0, "pending")
+		r.remember(h)
+		return
+	}
+	if r.stale(h) {
+		if err := removePending(r.store.Dir(), h.lower); err != nil {
+			r.logf("error", h.rule, 0, 0, "pending")
+		}
+		r.forget(h.lower)
+	}
+}
+
+func (r *Runner) checkpoint(now time.Time) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	return r.checkpointLocked(now)
+}
+
+func (r *Runner) checkpointLocked(now time.Time) error {
+	if r.abandoned.Load() {
+		return nil
+	}
+	r.mu.Lock()
+	if r.segmentStart.IsZero() {
+		r.mu.Unlock()
+		return nil
+	}
+	acc := r.accumulated
+	d := now.Sub(r.segmentStart)
+	if d > 0 {
+		acc += d
+	}
+	r.accumulated = acc
+	r.segmentStart = now
+	r.mu.Unlock()
+	if r.abandoned.Load() {
+		return nil
+	}
+	return saveOpenSegment(r.store, acc, now)
+}
+
+func (r *Runner) detachSegmentLocked() error {
+	r.mu.Lock()
+	acc := r.accumulated
+	r.segmentStart = time.Time{}
+	r.mu.Unlock()
+	if r.abandoned.Load() {
+		return nil
+	}
+	return saveOpenSegment(r.store, acc, time.Time{})
 }
 
 func (r *Runner) saveResult(in store.NewResult) (int64, error) {
@@ -444,6 +645,30 @@ func (r *Runner) remember(h hit) bool {
 	}
 	r.pending = append(r.pending, h)
 	return true
+}
+
+func (r *Runner) stamp(h *hit) {
+	h.seq = r.hitSeq.Add(1)
+}
+
+func (r *Runner) cancel(lower string) {
+	r.cancelMu.Lock()
+	defer r.cancelMu.Unlock()
+	if r.cancelled == nil {
+		r.cancelled = make(map[string]uint64)
+	}
+	mark := r.hitSeq.Load()
+	if old, ok := r.cancelled[lower]; ok && old > mark {
+		mark = old
+	}
+	r.cancelled[lower] = mark
+}
+
+func (r *Runner) stale(h hit) bool {
+	r.cancelMu.Lock()
+	defer r.cancelMu.Unlock()
+	mark, ok := r.cancelled[h.lower]
+	return ok && h.seq <= mark
 }
 
 func (r *Runner) forget(lower string) {
@@ -485,6 +710,7 @@ func (r *Runner) importPending() {
 	}
 	for i := range hits {
 		h := hits[i]
+		r.stamp(&h)
 		select {
 		case r.events <- event{hit: &h}:
 		default:
@@ -505,6 +731,9 @@ func (r *Runner) drain() {
 }
 
 func (r *Runner) syncFlush() {
+	if r.abandoned.Load() {
+		return
+	}
 	done := make(chan struct{})
 	r.events <- event{flushAttempts: true, done: done}
 	<-done

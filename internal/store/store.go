@@ -48,10 +48,11 @@ type NewResult struct {
 }
 
 type Store struct {
-	mu   sync.Mutex
-	db   *sql.DB
-	path string
-	lock *single.Lock
+	mu     sync.Mutex
+	closed bool
+	db     *sql.DB
+	path   string
+	lock   *single.Lock
 }
 
 func Open(path string) (*Store, error) {
@@ -83,13 +84,27 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	err := s.db.Close()
 	if s.lock != nil {
 		if rerr := s.lock.Release(); err == nil {
 			err = rerr
 		}
+		s.lock = nil
 	}
 	return err
+}
+
+func (s *Store) guard() error {
+	if s.closed {
+		return errors.New("closed")
+	}
+	return nil
 }
 
 func (s *Store) Dir() string {
@@ -173,6 +188,9 @@ type Admin struct {
 func (s *Store) CreateAdmin(username string, hash, salt []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admin`).Scan(&n); err != nil {
 		return err
@@ -188,6 +206,9 @@ func (s *Store) CreateAdmin(username string, hash, salt []byte) error {
 func (s *Store) Admin() (Admin, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return Admin{}, false, err
+	}
 	var a Admin
 	err := s.db.QueryRow(`SELECT username, password_hash, salt FROM admin WHERE id = 1`).Scan(&a.Username, &a.Hash, &a.Salt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -207,6 +228,9 @@ func (s *Store) HasAdmin() (bool, error) {
 func (s *Store) Settings() (Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return Settings{}, err
+	}
 	return s.settingsLocked()
 }
 
@@ -244,6 +268,9 @@ func (s *Store) settingsLocked() (Settings, error) {
 func (s *Store) SetCPU(n int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`UPDATE settings SET cpu_percent = ?, updated_at = ? WHERE id = 1`, n, nowText())
 	return err
 }
@@ -251,6 +278,9 @@ func (s *Store) SetCPU(n int) error {
 func (s *Store) SetRules(rules map[string]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`UPDATE settings SET rule_8a = ?, rule_9a = ?, rule_18 = ?, rule_19 = ?, updated_at = ? WHERE id = 1`,
 		boolInt(rules["8A"]), boolInt(rules["9A"]), boolInt(rules["1-8"]), boolInt(rules["1-9"]), nowText())
 	return err
@@ -259,6 +289,9 @@ func (s *Store) SetRules(rules map[string]bool) error {
 func (s *Store) SetAttempts(n uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`UPDATE settings SET attempts = ?, updated_at = ? WHERE id = 1`, n, nowText())
 	return err
 }
@@ -266,6 +299,9 @@ func (s *Store) SetAttempts(n uint64) error {
 func (s *Store) MarkRunning(at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`UPDATE settings SET running = 1, segment_started_at = ?, updated_at = ? WHERE id = 1`, at.UTC().Format(time.RFC3339Nano), nowText())
 	return err
 }
@@ -273,13 +309,44 @@ func (s *Store) MarkRunning(at time.Time) error {
 func (s *Store) TouchSegment(at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`UPDATE settings SET segment_started_at = ?, updated_at = ? WHERE id = 1`, at.UTC().Format(time.RFC3339Nano), nowText())
+	return err
+}
+
+func (s *Store) CountResults() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return 0, err
+	}
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM results`).Scan(&n)
+	return n, err
+}
+
+func (s *Store) SaveOpenSegment(accumulated time.Duration, segment time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
+	if segment.IsZero() {
+		_, err := s.db.Exec(`UPDATE settings SET accumulated_ms = ?, segment_started_at = NULL, updated_at = ? WHERE id = 1`, accumulated.Milliseconds(), nowText())
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE settings SET accumulated_ms = ?, segment_started_at = ?, updated_at = ? WHERE id = 1`, accumulated.Milliseconds(), segment.UTC().Format(time.RFC3339Nano), nowText())
 	return err
 }
 
 func (s *Store) MarkStopped(now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	st, err := s.settingsLocked()
 	if err != nil {
 		return err
@@ -299,6 +366,9 @@ func (s *Store) MarkStopped(now time.Time) error {
 func (s *Store) SaveResult(key []byte, in NewResult) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return 0, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -329,6 +399,9 @@ func (s *Store) SaveResult(key []byte, in NewResult) (int64, error) {
 func (s *Store) List(rule string) ([]ResultMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.Query(`SELECT id, rule, length, address_checksum, address_lower, created_at FROM results WHERE rule = ? ORDER BY id DESC`, rule)
 	if err != nil {
 		return nil, err
@@ -354,6 +427,9 @@ func (s *Store) List(rule string) ([]ResultMeta, error) {
 func (s *Store) LastHit(rule string) (time.Time, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return time.Time{}, false, err
+	}
 	var created sql.NullString
 	err := s.db.QueryRow(`SELECT created_at FROM results WHERE rule = ? ORDER BY id DESC LIMIT 1`, rule).Scan(&created)
 	if errors.Is(err, sql.ErrNoRows) || !created.Valid {
@@ -372,6 +448,9 @@ func (s *Store) LastHit(rule string) (time.Time, bool, error) {
 func (s *Store) Get(id int64) (ResultSecret, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return ResultSecret{}, err
+	}
 	var item ResultSecret
 	var created string
 	err := s.db.QueryRow(`SELECT id, rule, length, address_checksum, address_lower, nonce, ciphertext, created_at FROM results WHERE id = ?`, id).
@@ -393,6 +472,9 @@ func (s *Store) Get(id int64) (ResultSecret, error) {
 func (s *Store) Delete(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`UPDATE results SET nonce = zeroblob(length(nonce)), ciphertext = zeroblob(length(ciphertext)) WHERE id = ?`, id); err != nil {
 		return err
 	}
@@ -407,21 +489,41 @@ func (s *Store) Delete(id int64) error {
 	if n == 0 {
 		return errors.New("not_found")
 	}
-	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	if err := scrubAfterDelete(s.db, s.path); err != nil {
+		return ErrScrub
+	}
+	return nil
+}
+
+var ErrScrub = errors.New("scrub")
+
+func SetScrubHook(fn func(*sql.DB, string) error) func() {
+	old := scrubAfterDelete
+	if fn != nil {
+		scrubAfterDelete = fn
+	}
+	return func() { scrubAfterDelete = old }
+}
+
+var scrubAfterDelete = func(db *sql.DB, path string) error {
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`VACUUM`); err != nil {
+	if _, err := db.Exec(`VACUUM`); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return err
 	}
-	return chmodOwner(s.path)
+	return chmodOwner(path)
 }
 
 func (s *Store) RawCiphertext(id int64) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.guard(); err != nil {
+		return nil, err
+	}
 	var ct []byte
 	err := s.db.QueryRow(`SELECT ciphertext FROM results WHERE id = ?`, id).Scan(&ct)
 	return ct, err

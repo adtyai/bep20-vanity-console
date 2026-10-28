@@ -2,10 +2,12 @@ package secret
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -70,29 +72,37 @@ func TestKeyFilePermissions(t *testing.T) {
 	}
 }
 
-func TestShortSecretKeyIsReplaced(t *testing.T) {
+func TestShortSecretKeyIsKept(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secret.key")
 	if err := os.WriteFile(path, []byte("shortkey"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	key, err := LoadOrCreateKey(path)
-	if err != nil {
-		t.Fatalf("short key blocked restart: %v", err)
-	}
-	if len(key) != 32 {
-		t.Fatalf("len %d", len(key))
+	if _, err := LoadOrCreateKey(path); err == nil {
+		t.Fatal("short key was accepted")
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, key) {
-		t.Fatal("file does not match new key")
+	if !bytes.Equal(got, []byte("shortkey")) {
+		t.Fatal("short key was replaced")
 	}
-	again, err := LoadOrCreateKey(path)
-	if err != nil || !bytes.Equal(again, key) {
-		t.Fatalf("reload err=%v changed=%v", err, !bytes.Equal(again, key))
+}
+
+func TestNewlineSecretKeyIsKept(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.key")
+	key := bytes.Repeat([]byte{7}, 32)
+	if err := os.WriteFile(path, append(append([]byte(nil), key...), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreateKey(path); err == nil {
+		t.Fatal("newline key was accepted")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || len(got) != 33 || !bytes.HasPrefix(got, key) {
+		t.Fatalf("file changed len=%d err=%v", len(got), err)
 	}
 }
 
@@ -205,22 +215,127 @@ func TestConcurrentShortKeyRepairDoesNotSplit(t *testing.T) {
 		close(start)
 		wg.Wait()
 		file, err := os.ReadFile(path)
-		if err != nil || len(file) != 32 {
-			t.Fatalf("trial %d file len=%d err=%v", trial, len(file), err)
+		if err != nil || !bytes.Equal(file, []byte("shortkey")) {
+			t.Fatalf("trial %d file changed len=%d err=%v", trial, len(file), err)
 		}
-		var first []byte
 		for i := 0; i < workers; i++ {
-			if errs[i] != nil {
-				t.Fatalf("trial %d caller %d: %v", trial, i, errs[i])
-			}
-			if len(keys[i]) != 32 || !bytes.Equal(keys[i], file) {
-				t.Fatalf("trial %d caller %d key diverged from file", trial, i)
-			}
-			if first == nil {
-				first = keys[i]
-			} else if !bytes.Equal(keys[i], first) {
-				t.Fatalf("trial %d callers returned different keys", trial)
+			if errs[i] == nil || keys[i] != nil {
+				t.Fatalf("trial %d caller %d replaced short key", trial, i)
 			}
 		}
+	}
+}
+
+func TestNewKeyDirSyncErrorIsReturned(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.key")
+	key := bytes.Repeat([]byte{3}, 32)
+	old := syncDirFile
+	syncDirFile = func(*os.File) error { return errors.New("dirsync") }
+	t.Cleanup(func() { syncDirFile = old })
+	err := writeNewFile(path, key, 0o600)
+	if err == nil || err.Error() != "dirsync" {
+		t.Fatalf("dir sync swallowed: %v", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(got, key) {
+		t.Fatalf("key file lost after dir sync failure: %v", readErr)
+	}
+	syncDirFile = old
+	loaded, err := LoadOrCreateKey(path)
+	if err != nil || !bytes.Equal(loaded, key) {
+		t.Fatalf("restart did not keep written key: %v", err)
+	}
+}
+
+func TestAtomicKeyDirSyncErrorIsReturned(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.key")
+	key := bytes.Repeat([]byte{4}, 32)
+	old := syncDirFile
+	syncDirFile = func(*os.File) error { return errors.New("dirsync") }
+	t.Cleanup(func() { syncDirFile = old })
+	err := writeAtomic(path, key, 0o600)
+	if err == nil || err.Error() != "dirsync" {
+		t.Fatalf("dir sync swallowed: %v", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(got, key) {
+		t.Fatalf("key file lost after dir sync failure: %v", readErr)
+	}
+}
+
+func TestReplaceFileWhenRenameCannotOverwrite(t *testing.T) {
+	old := renameFile
+	renameFile = func(oldpath, newpath string) error {
+		if _, err := os.Stat(newpath); err == nil {
+			return os.ErrExist
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	t.Cleanup(func() { renameFile = old })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.key")
+	if err := os.WriteFile(path, []byte("shortkey"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{7}, 32)
+	if err := SaveKey(path, key); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("not replaced: %v %q", err, got)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("bak left behind")
+	}
+}
+
+func TestAdoptBackupWhenKeyMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.key")
+	key := bytes.Repeat([]byte{8}, 32)
+	if err := os.WriteFile(path+".bak", key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := AdoptPendingKey(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("bak not adopted: %v", err)
+	}
+}
+
+func TestCannotReplaceRecognizesWindowsErrno(t *testing.T) {
+	err := &os.LinkError{Op: "rename", Old: "a", New: "b", Err: syscall.Errno(183)}
+	if !cannotReplace(err) || !cannotReplace(os.ErrExist) || !cannotReplace(&os.LinkError{Err: syscall.Errno(80)}) {
+		t.Fatal("windows replace error not recognized")
+	}
+	if cannotReplace(errors.New("permission")) {
+		t.Fatal("unrelated error")
+	}
+}
+
+func TestWindowsDirectorySyncUnsupportedIsNotFatal(t *testing.T) {
+	denied := &os.PathError{Op: "sync", Path: "data", Err: syscall.Errno(5)}
+	if normalizeDirSyncOS(denied, true) != nil {
+		t.Fatal("windows directory sync access denied treated as fatal")
+	}
+	if normalizeDirSyncOS(&os.PathError{Op: "sync", Path: "data", Err: syscall.Errno(1)}, true) != nil {
+		t.Fatal("windows directory sync invalid function treated as fatal")
+	}
+	if normalizeDirSyncOS(&os.PathError{Op: "sync", Path: "data", Err: syscall.Errno(87)}, true) != nil {
+		t.Fatal("windows directory sync invalid parameter treated as fatal")
+	}
+	if normalizeDirSyncOS(denied, false) == nil {
+		t.Fatal("non-windows access denied was ignored")
+	}
+	if normalizeDirSyncOS(&os.PathError{Op: "sync", Path: "data", Err: syscall.Errno(112)}, true) == nil {
+		t.Fatal("windows disk full was ignored")
+	}
+	if normalizeDirSyncOS(nil, true) != nil {
+		t.Fatal("nil sync error became an error")
 	}
 }

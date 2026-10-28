@@ -46,7 +46,25 @@ func openRuntime(dataDir string) (*store.Store, []byte, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	key, err := secret.LoadOrCreateKey(filepath.Join(dataDir, "secret.key"))
+	keyPath := filepath.Join(dataDir, "secret.key")
+	if err := secret.AdoptPendingKey(keyPath); err != nil {
+		_ = st.Close()
+		return nil, nil, errors.New("secret_key")
+	}
+	if _, err := os.Stat(keyPath); errors.Is(err, os.ErrNotExist) {
+		sealed, serr := hasSealedData(st, dataDir)
+		if serr != nil || sealed {
+			_ = st.Close()
+			if serr != nil {
+				return nil, nil, serr
+			}
+			return nil, nil, errors.New("secret_key")
+		}
+	} else if err != nil {
+		_ = st.Close()
+		return nil, nil, errors.New("secret_key")
+	}
+	key, err := secret.LoadOrCreateKey(keyPath)
 	if err != nil {
 		_ = st.Close()
 		return nil, nil, errors.New("secret_key")
@@ -54,18 +72,68 @@ func openRuntime(dataDir string) (*store.Store, []byte, error) {
 	return st, key, nil
 }
 
+func hasSealedData(st *store.Store, dataDir string) (bool, error) {
+	n, err := st.CountResults()
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "pending"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(entries) > 0, nil
+}
+
+func startedLine(addr net.Addr) string {
+	if addr == nil {
+		return "已启动"
+	}
+	return "已启动 " + addr.String()
+}
+
+func startupMessage(err error) string {
+	if err == nil {
+		return "启动失败"
+	}
+	switch err.Error() {
+	case "setup_token":
+		return "缺少 SETUP_TOKEN"
+	case "listen":
+		return "监听地址必须是本机回环"
+	case "lock":
+		return "已有进程在运行"
+	case "secret_key":
+		return "密钥文件不可用"
+	default:
+		return "启动失败"
+	}
+}
+
+func requireSetupToken(hasAdmin bool, token string) error {
+	if hasAdmin || config.SetupTokenOK(token) {
+		return nil
+	}
+	return errors.New("setup_token")
+}
+
 func run() int {
 	single.Tighten()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		logx.Event("error", "", 0, 0, "config")
-		fmt.Fprintln(os.Stderr, "启动失败")
+		fmt.Fprintln(os.Stderr, startupMessage(err))
 		return 1
 	}
 	st, key, err := openRuntime(cfg.DataDir)
 	if err != nil {
 		logx.Event("error", "", 0, 0, startupKind(err))
-		fmt.Fprintln(os.Stderr, "启动失败")
+		fmt.Fprintln(os.Stderr, startupMessage(err))
 		return 1
 	}
 	defer st.Close()
@@ -74,6 +142,17 @@ func run() int {
 			logx.Event("error", "", 0, 0, "secret_key")
 		}
 	}()
+	hasAdmin, err := st.HasAdmin()
+	if err != nil {
+		logx.Event("error", "", 0, 0, "store")
+		fmt.Fprintln(os.Stderr, "启动失败")
+		return 1
+	}
+	if err := requireSetupToken(hasAdmin, cfg.SetupToken); err != nil {
+		logx.Event("error", "", 0, 0, "setup_token")
+		fmt.Fprintln(os.Stderr, startupMessage(err))
+		return 1
+	}
 	logf := func(event, rule string, id int64, count uint64, errorType string) {
 		logx.Event(event, rule, id, count, errorType)
 	}
@@ -106,7 +185,7 @@ func run() int {
 		runner.Shutdown()
 		return 1
 	}
-	fmt.Fprintln(os.Stderr, "已启动")
+	fmt.Fprintln(os.Stderr, startedLine(ln.Addr()))
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.Serve(ln)
@@ -116,7 +195,7 @@ func run() int {
 	select {
 	case <-ctx.Done():
 		runner.Shutdown()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 		return 0

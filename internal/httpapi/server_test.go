@@ -2,15 +2,19 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +38,8 @@ type harness struct {
 	runner *job.Runner
 	key    []byte
 	c      *client
+	logs   []string
+	logMu  sync.Mutex
 }
 
 type client struct {
@@ -50,14 +56,20 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	key := bytes.Repeat([]byte{9}, 32)
+	harn := &harness{t: t, st: st, key: key}
+	logf := func(event, rule string, id int64, count uint64, errorType string) {
+		harn.logMu.Lock()
+		harn.logs = append(harn.logs, event+" "+rule+" "+strconv.FormatInt(id, 10)+" "+errorType)
+		harn.logMu.Unlock()
+	}
 	runner := job.New(st, key, func() (string, string, string, error) {
 		return "", "", "", errors.New("idle")
-	}, 1, nil)
+	}, 1, logf)
 	if err := runner.Boot(); err != nil {
 		t.Fatal(err)
 	}
 	mgr := auth.New(st, auth.Params{Time: 1, Memory: 8 * 1024, Threads: 1, KeyLen: 32}, time.Now)
-	h, err := New(st, runner, mgr, testToken, nil)
+	handler, err := New(st, runner, mgr, testToken, logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,10 +77,9 @@ func newHarness(t *testing.T) *harness {
 		runner.Shutdown()
 		st.Close()
 	})
-	return &harness{
-		t: t, st: st, runner: runner, key: key,
-		c: &client{h: h, jar: map[string]*http.Cookie{}, header: http.Header{}},
-	}
+	harn.runner = runner
+	harn.c = &client{h: handler, jar: map[string]*http.Cookie{}, header: http.Header{}}
+	return harn
 }
 
 func (c *client) do(method, path, body string) *http.Response {
@@ -413,6 +424,12 @@ func TestKnownVectorRevealAndHomeHidesKey(t *testing.T) {
 	if !strings.Contains(body, "<title>BEP20 自用靓号台</title>") || !strings.Contains(body, "<h2>私钥</h2>") {
 		t.Fatal(body)
 	}
+	h.logMu.Lock()
+	joined := strings.Join(h.logs, "\n")
+	h.logMu.Unlock()
+	if !strings.Contains(joined, "reveal") || strings.Contains(joined, knownKey) {
+		t.Fatalf("reveal audit missing or leaked key: %s", joined)
+	}
 }
 
 func TestUnknownPathIsChinese(t *testing.T) {
@@ -446,7 +463,7 @@ func TestDeleteConfirmDoesNotOverclaim(t *testing.T) {
 	csrf, _ := h.home()
 	res := h.c.do(http.MethodPost, "/results/"+itoa(id)+"/delete", url.Values{"csrf": {csrf}}.Encode())
 	body := readBody(t, res)
-	if res.StatusCode != http.StatusOK || strings.Contains(body, "只删除服务器上的记录") || !strings.Contains(body, "覆盖库里的密文") {
+	if res.StatusCode != http.StatusOK || strings.Contains(body, "只删除服务器上的记录") || !strings.Contains(body, "覆盖库里的密文") || !strings.Contains(body, "待写文件") {
 		t.Fatalf("%d %s", res.StatusCode, body)
 	}
 }
@@ -492,7 +509,7 @@ func TestHomeWarnsWhenSavePending(t *testing.T) {
 	}
 	h.runner.EnqueueHit("8A", 8, sum, lower, knownKey)
 	_, body := h.home()
-	if !strings.Contains(body, "有命中尚未写入") || strings.Contains(body, "无法重试") || strings.Contains(body, knownKey) || strings.Contains(body, "0x"+knownKey) {
+	if !strings.Contains(body, "有命中尚未写入") || strings.Contains(body, "无法重试") || strings.Contains(body, "进程退出前会继续重试") || strings.Contains(body, knownKey) || strings.Contains(body, "0x"+knownKey) {
 		t.Fatalf("warning missing or key leaked: %s", body)
 	}
 }
@@ -548,6 +565,170 @@ func TestSecureCookieBehindHTTPS(t *testing.T) {
 	h.login()
 	if !h.c.jar["vanity_session"].Secure {
 		t.Fatal("session cookie was not secure")
+	}
+}
+
+func TestRunningRefreshDoesNotWipeEdits(t *testing.T) {
+	h := newHarness(t)
+	h.createAdmin()
+	h.login()
+	_, stopped := h.home()
+	if strings.Contains(stopped, `http-equiv="refresh"`) || strings.Contains(stopped, `name="live-refresh"`) {
+		t.Fatal("stopped page refreshes")
+	}
+	csrf, _ := h.home()
+	res := h.c.do(http.MethodPost, "/start", url.Values{"csrf": {csrf}}.Encode())
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("start %d %s", res.StatusCode, readBody(t, res))
+	}
+	res.Body.Close()
+	_, body := h.home()
+	if strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatal("meta refresh reloads over unsaved edits")
+	}
+	if !strings.Contains(body, `name="live-refresh"`) {
+		t.Fatal("running page lost live update")
+	}
+	res = h.c.do(http.MethodGet, "/assets/app.js", "")
+	js := readBody(t, res)
+	if res.StatusCode != http.StatusOK || !strings.Contains(js, "live-refresh") || !strings.Contains(js, "defaultValue") {
+		t.Fatal("script reloads without checking unsaved fields")
+	}
+}
+
+func TestConfirmedDeleteRemovesPending(t *testing.T) {
+	h := newHarness(t)
+	h.createAdmin()
+	h.login()
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(knownKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := h.st.SaveResult(h.key, store.NewResult{
+		Rule: "8A", Length: 8, Checksum: sum, Lower: lower, PrivHex: knownKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(lower))
+	pending := filepath.Join(h.st.Dir(), "pending")
+	if err := os.MkdirAll(pending, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(pending, hex.EncodeToString(digest[:16]))
+	if err := os.WriteFile(path, []byte("sealed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	csrf, _ := h.home()
+	res := h.c.do(http.MethodPost, "/results/"+itoa(id)+"/delete", url.Values{"csrf": {csrf}, "confirm": {"yes"}}.Encode())
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("delete %d %s", res.StatusCode, readBody(t, res))
+	}
+	res.Body.Close()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("pending kept: %v", err)
+	}
+}
+
+func TestClearBrokenPendingKeepsValidFile(t *testing.T) {
+	dir := t.TempDir()
+	pending := filepath.Join(dir, "pending")
+	if err := os.MkdirAll(pending, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(pending, "0123456789abcdef0123456789abcdef")
+	if err := os.WriteFile(broken, []byte("not-a-valid-box"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{9}, 32)
+	runner := job.New(st, key, func() (string, string, string, error) {
+		return "", "", "", errors.New("idle")
+	}, 1, nil)
+	if err := runner.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		runner.Shutdown()
+		st.Close()
+	})
+	runner.HookSave(func([]byte, store.NewResult) (int64, error) {
+		return 0, errors.New("busy")
+	})
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(knownKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.EnqueueHit("8A", 8, sum, lower, knownKey)
+	mgr := auth.New(st, auth.Params{Time: 1, Memory: 8 * 1024, Threads: 1, KeyLen: 32}, time.Now)
+	handler, err := New(st, runner, mgr, testToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &harness{t: t, st: st, runner: runner, key: key, c: &client{h: handler, jar: map[string]*http.Cookie{}, header: http.Header{}}}
+	h.createAdmin()
+	h.login()
+	_, body := h.home()
+	if !strings.Contains(body, "清除损坏文件") || !strings.Contains(body, "无法重试") {
+		t.Fatalf("missing clear entry: %s", body)
+	}
+	csrf, _ := h.home()
+	res := h.c.do(http.MethodPost, "/pending/clear", url.Values{"csrf": {csrf}}.Encode())
+	body = readBody(t, res)
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, "确认清除") {
+		t.Fatalf("confirm %d %s", res.StatusCode, body)
+	}
+	res = h.c.do(http.MethodPost, "/pending/clear", url.Values{"csrf": {csrf}, "confirm": {"yes"}}.Encode())
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("clear %d %s", res.StatusCode, readBody(t, res))
+	}
+	res.Body.Close()
+	if _, err := os.Stat(broken); !os.IsNotExist(err) {
+		t.Fatalf("broken kept: %v", err)
+	}
+	left, err := os.ReadDir(pending)
+	if err != nil || len(left) == 0 {
+		t.Fatalf("valid pending removed: %v %v", left, err)
+	}
+	_, body = h.home()
+	if strings.Contains(body, "无法重试") || strings.Contains(body, knownKey) {
+		t.Fatalf("warning or key remained: %s", body)
+	}
+}
+
+func TestDeleteScrubFailureIsNotHTTP500(t *testing.T) {
+	h := newHarness(t)
+	h.createAdmin()
+	h.login()
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(knownKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := h.st.SaveResult(h.key, store.NewResult{
+		Rule: "8A", Length: 8, Checksum: sum, Lower: lower, PrivHex: knownKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := store.SetScrubHook(func(*sql.DB, string) error { return errors.New("vacuum") })
+	defer restore()
+	csrf, _ := h.home()
+	res := h.c.do(http.MethodPost, "/results/"+itoa(id)+"/delete", url.Values{"csrf": {csrf}, "confirm": {"yes"}}.Encode())
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("delete %d %s", res.StatusCode, readBody(t, res))
+	}
+	res.Body.Close()
+	if _, err := h.st.Get(id); err == nil || err.Error() != "not_found" {
+		t.Fatalf("row kept: %v", err)
+	}
+	h.logMu.Lock()
+	joined := strings.Join(h.logs, "\n")
+	h.logMu.Unlock()
+	if !strings.Contains(joined, "scrub") || strings.Contains(joined, knownKey) {
+		t.Fatalf("scrub log missing or leaked: %s", joined)
 	}
 }
 

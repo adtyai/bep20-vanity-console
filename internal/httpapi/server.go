@@ -33,25 +33,27 @@ type Server struct {
 }
 
 type view struct {
-	Title       string
-	Refresh     bool
-	CSRF        string
-	Error       string
-	Username    string
-	Running     bool
-	CPU         int
-	Attempts    uint64
-	Speed       string
-	Runtime     string
-	Rules       []ruleView
-	Message     string
-	Action      string
-	AddressHead string
-	AddressTail string
-	Address     string
-	Priv        string
-	Found       string
-	LengthLabel string
+	Title         string
+	Refresh       bool
+	CSRF          string
+	Error         string
+	Username      string
+	Running       bool
+	Exiting       bool
+	Stoppable     bool
+	CPU           int
+	Attempts      uint64
+	Speed         string
+	Runtime       string
+	Rules         []ruleView
+	Message       string
+	Action        string
+	AddressHead   string
+	AddressTail   string
+	Address       string
+	Priv          string
+	Found         string
+	LengthLabel   string
 	SaveWarning   string
 	BrokenWarning string
 }
@@ -120,6 +122,7 @@ func New(st *store.Store, runner *job.Runner, manager *auth.Manager, setupToken 
 	mux.HandleFunc("GET /results", s.resultsGET)
 	mux.HandleFunc("POST /results/{id}/reveal", s.revealPOST)
 	mux.HandleFunc("POST /results/{id}/delete", s.deletePOST)
+	mux.HandleFunc("POST /pending/clear", s.clearBrokenPOST)
 	mux.HandleFunc("GET /assets/app.js", s.assetJS)
 	mux.HandleFunc("GET /assets/app.css", s.assetCSS)
 	mux.HandleFunc("/", s.notFound)
@@ -384,6 +387,7 @@ func (s *Server) revealPOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := strings.TrimPrefix(strings.ToLower(plain), "0x")
+	s.logf("reveal", rec.Rule, id, 1, "")
 	s.render(w, http.StatusOK, "reveal", view{
 		Title:       "BEP20 自用靓号台",
 		AddressHead: head,
@@ -411,12 +415,12 @@ func (s *Server) deletePOST(w http.ResponseWriter, r *http.Request) {
 		s.render(w, http.StatusOK, "confirm", view{
 			Title:   "确认删除",
 			CSRF:    sess.CSRF,
-			Message: "确认删除这条结果？列表会去掉这一行，并覆盖库里的密文。已经复制走的私钥仍然有效。",
+			Message: "确认删除这条结果？列表会去掉这一行，并覆盖库里的密文，同时覆盖待写文件中的密文。已经复制走的私钥仍然有效。",
 			Action:  "/results/" + strconv.FormatInt(id, 10) + "/delete",
 		})
 		return
 	}
-	if err := s.store.Delete(id); err != nil {
+	if err := s.runner.DeleteResult(id); err != nil {
 		if err.Error() == "not_found" {
 			s.writeError(w, http.StatusNotFound, "未找到")
 			return
@@ -432,14 +436,16 @@ func (s *Server) deletePOST(w http.ResponseWriter, r *http.Request) {
 func (s *Server) renderHome(w http.ResponseWriter, sess auth.Session) {
 	snap := s.runner.Snapshot()
 	page := view{
-		Title:       "BEP20 自用靓号台",
-		Refresh:     snap.Running,
-		CSRF:        sess.CSRF,
-		Running:     snap.Running,
-		CPU:         snap.CPU,
-		Attempts:    snap.Attempts,
-		Speed:       speedText(snap),
-		Runtime:     runtimeText(snap.Runtime),
+		Title:         "BEP20 自用靓号台",
+		Refresh:       snap.Running || snap.Exiting,
+		CSRF:          sess.CSRF,
+		Running:       snap.Running,
+		Exiting:       snap.Exiting,
+		Stoppable:     snap.Stoppable,
+		CPU:           snap.CPU,
+		Attempts:      snap.Attempts,
+		Speed:         speedText(snap),
+		Runtime:       runtimeText(snap.Runtime),
 		SaveWarning:   saveWarning(snap.Unsaved),
 		BrokenWarning: brokenWarning(snap.Broken),
 	}
@@ -593,18 +599,45 @@ func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
 	s.writeError(w, http.StatusNotFound, "未找到")
 }
 
+func (s *Server) clearBrokenPOST(w http.ResponseWriter, r *http.Request) {
+	if !s.parse(w, r) {
+		return
+	}
+	sess, ok := s.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if r.FormValue("confirm") != "yes" {
+		s.render(w, http.StatusOK, "confirm", view{
+			Title:   "确认清除",
+			CSRF:    sess.CSRF,
+			Message: "确认清除损坏的待写文件？能导入的文件会保留。损坏文件里的密文会被覆盖后删除。",
+			Action:  "/pending/clear",
+		})
+		return
+	}
+	n, err := s.runner.ClearBroken()
+	if err != nil {
+		s.logf("error", "", 0, 0, "pending")
+		s.writeError(w, http.StatusInternalServerError, "内部错误")
+		return
+	}
+	s.logf("clear", "", 0, uint64(n), "pending")
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func saveWarning(n int) string {
 	if n <= 0 {
 		return ""
 	}
-	return "有命中尚未写入，请检查磁盘。进程退出前会继续重试。"
+	return "有命中尚未写入数据库。已落到待写文件的会在下次启动导入。请勿强制结束进程。"
 }
 
 func brokenWarning(n int) string {
 	if n <= 0 {
 		return ""
 	}
-	return "有待写文件已损坏，无法重试。"
+	return "有待写文件已损坏，无法重试。可以清除这些损坏文件。"
 }
 
 func (s *Server) writeError(w http.ResponseWriter, status int, msg string) {

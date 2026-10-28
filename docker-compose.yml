@@ -1,0 +1,13 @@
+services:
+  bep20-vanity-console:
+    image: ghcr.io/adtyai/bep20-vanity-console:latest
+    container_name: bep20-vanity-console
+    network_mode: host
+    stop_grace_period: 30s
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      LISTEN: 127.0.0.1:3920
+      SETUP_TOKEN: ${SETUP_TOKEN:-}
+    volumes:
+      - ./data:/data

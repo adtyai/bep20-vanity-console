@@ -1,7 +1,7 @@
 {{define "home"}}
 {{template "head" .}}
 <section class="stats">
-  <div class="panel"><div class="muted">状态</div><strong>{{if .Running}}运行中{{else}}已停止{{end}}</strong></div>
+  <div class="panel"><div class="muted">状态</div><strong>{{if .Running}}运行中{{else if .Exiting}}正在退出{{else}}已停止{{end}}</strong></div>
   <div class="panel"><div class="muted">已尝试</div><strong>{{.Attempts}}</strong></div>
   <div class="panel"><div class="muted">速度</div><strong>{{.Speed}}</strong></div>
   <div class="panel"><div class="muted">已运行</div><strong>{{.Runtime}}</strong></div>
@@ -9,14 +9,23 @@
 <section class="panel">
   <p class="muted">关闭浏览器不会停止。普通号不会保存。这是生成器，不负责收款。</p>
   {{if .SaveWarning}}<p class="error">{{.SaveWarning}}</p>{{end}}
-  {{if .BrokenWarning}}<p class="error">{{.BrokenWarning}}</p>{{end}}
+  {{if .BrokenWarning}}
+  <p class="error">{{.BrokenWarning}}</p>
+  <form method="post" action="/pending/clear">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="danger" type="submit">清除损坏文件</button>
+  </form>
+  {{end}}
+  {{if .Exiting}}
+  <p class="muted">{{if .Stoppable}}进程正在退出。点停止后，下次启动不会继续生成。{{else}}进程正在退出，已经停止。下次启动不会继续生成。{{end}}</p>
+  {{end}}
   <div class="row">
-    {{if .Running}}
+    {{if .Stoppable}}
     <form method="post" action="/stop">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button class="danger" type="submit">停止</button>
     </form>
-    {{else}}
+    {{else if not .Exiting}}
     <form method="post" action="/start">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <button type="submit">开始生成</button>

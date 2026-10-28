@@ -23,9 +23,13 @@ RUN apt-get update \
     && chown vanity:vanity /data
 
 COPY --from=build /out/bep20-vanity-console /usr/local/bin/bep20-vanity-console
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY NOTICE /licenses/NOTICE
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
-USER vanity
 WORKDIR /data
 ENV DATA_DIR=/data
-ENTRYPOINT ["/usr/local/bin/bep20-vanity-console"]
+# Start as root only to give /data to vanity, then drop privileges.
+# Listen stays on 127.0.0.1. Use host networking. Do not publish ports.
+# Stop grace is a runtime setting; the documented compose uses 30s.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

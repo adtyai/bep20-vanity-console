@@ -31,14 +31,15 @@ func Load(getenv func(string) string) (Config, error) {
 		dataDir = DefaultDataDir
 	}
 	token := getenv("SETUP_TOKEN")
-	if utf8.RuneCountInString(token) < MinSecretLen {
-		return Config{}, errors.New("setup_token")
-	}
 	listen = strings.TrimSpace(listen)
 	if err := validateListen(listen); err != nil {
 		return Config{}, err
 	}
 	return Config{Listen: listen, DataDir: dataDir, SetupToken: token}, nil
+}
+
+func SetupTokenOK(token string) bool {
+	return utf8.RuneCountInString(token) >= MinSecretLen
 }
 
 func validateListen(listen string) error {

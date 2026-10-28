@@ -8,7 +8,7 @@ func Event(event, rule string, id int64, count uint64, errorType string) {
 
 func cleanEvent(s string) string {
 	switch s {
-	case "hit", "error", "delete":
+	case "hit", "error", "delete", "reveal", "clear":
 		return s
 	default:
 		return "-"

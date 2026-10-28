@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"bep20-vanity-console/internal/secret"
+	"bep20-vanity-console/internal/vanity"
 )
 
 type pendingPayload struct {
@@ -54,6 +55,56 @@ func writePending(dir string, key []byte, h hit) error {
 	_, werr := f.Write(append(append([]byte{}, nonce...), ct...))
 	serr := f.Sync()
 	cerr := f.Close()
+	if werr != nil || serr != nil || cerr != nil {
+		_ = os.Remove(tmp)
+		if werr != nil {
+			return werr
+		}
+		if serr != nil {
+			return serr
+		}
+		return cerr
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := secret.ReplaceFile(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return secret.SyncDir(base)
+}
+
+var removeFile = os.Remove
+
+func removePending(dir, lower string) error {
+	base := filepath.Join(pendingDir(dir), pendingName(lower))
+	if err := wipeFile(base); err != nil {
+		return err
+	}
+	return wipeFile(base + ".tmp")
+}
+
+func wipeFile(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	var werr error
+	if info.Size() > 0 {
+		_, werr = f.WriteAt(make([]byte, info.Size()), 0)
+	}
+	serr := f.Sync()
+	cerr := f.Close()
 	if werr != nil {
 		return werr
 	}
@@ -63,23 +114,7 @@ func writePending(dir string, key []byte, h hit) error {
 	if cerr != nil {
 		return cerr
 	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, final)
-}
-
-func removePending(dir, lower string) error {
-	base := filepath.Join(pendingDir(dir), pendingName(lower))
-	err1 := os.Remove(base)
-	err2 := os.Remove(base + ".tmp")
-	if err1 != nil && !errors.Is(err1, os.ErrNotExist) {
-		return err1
-	}
-	if err2 != nil && !errors.Is(err2, os.ErrNotExist) {
-		return err2
-	}
-	return nil
+	return removeFile(path)
 }
 
 func loadPending(dir string, key []byte) ([]hit, int, error) {
@@ -94,29 +129,80 @@ func loadPending(dir string, key []byte) ([]hit, int, error) {
 	broken := 0
 	for _, ent := range entries {
 		name := ent.Name()
-		if ent.IsDir() || strings.HasSuffix(name, ".tmp") || len(name) != 32 {
+		if ent.IsDir() {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(pendingDir(dir), name))
-		if err != nil || len(b) < 12 {
+		h, ok, bad := pendingState(filepath.Join(pendingDir(dir), name), name, key)
+		if bad {
 			broken++
 			continue
 		}
-		plain, err := secret.Decrypt(key, b[:12], b[12:], []byte("pending"))
-		if err != nil {
-			broken++
-			continue
+		if ok {
+			hits = append(hits, h)
 		}
-		var payload pendingPayload
-		if err := json.Unmarshal(plain, &payload); err != nil || pendingName(payload.Lower) != name || payload.Priv == "" {
-			broken++
-			continue
-		}
-		hits = append(hits, hit{
-			rule: payload.Rule, length: payload.Length, checksum: payload.Checksum, lower: payload.Lower, privHex: payload.Priv,
-		})
 	}
 	return hits, broken, nil
+}
+
+func pendingState(path, name string, key []byte) (hit, bool, bool) {
+	baseName := name
+	tmp := strings.HasSuffix(name, ".tmp")
+	if tmp {
+		baseName = strings.TrimSuffix(name, ".tmp")
+	}
+	if len(baseName) != 32 {
+		return hit{}, false, tmp
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) < 12 {
+		return hit{}, false, true
+	}
+	plain, err := secret.Decrypt(key, b[:12], b[12:], []byte("pending"))
+	if err != nil {
+		return hit{}, false, true
+	}
+	var payload pendingPayload
+	if err := json.Unmarshal(plain, &payload); err != nil || pendingName(payload.Lower) != baseName || payload.Priv == "" {
+		return hit{}, false, true
+	}
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(payload.Priv)
+	if err != nil || sum != payload.Checksum || lower != payload.Lower {
+		return hit{}, false, true
+	}
+	return hit{
+		rule: payload.Rule, length: payload.Length, checksum: payload.Checksum, lower: payload.Lower, privHex: payload.Priv,
+	}, true, false
+}
+
+func clearBroken(dir string, key []byte) (int, error) {
+	entries, err := os.ReadDir(pendingDir(dir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	n := 0
+	var first error
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		path := filepath.Join(pendingDir(dir), name)
+		_, _, bad := pendingState(path, name, key)
+		if !bad {
+			continue
+		}
+		if err := wipeFile(path); err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		n++
+	}
+	return n, first
 }
 
 func alreadyStored(err error) bool {

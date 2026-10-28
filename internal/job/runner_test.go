@@ -316,6 +316,297 @@ func TestShutdownReturnsWhenWorkerStuck(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 }
 
+func TestShutdownReturnsWhenCheckpointStuck(t *testing.T) {
+	oldLimit := shutdownLimit
+	shutdownLimit = 40 * time.Millisecond
+	defer func() { shutdownLimit = oldLimit }()
+	oldSave := saveOpenSegment
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	saveOpenSegment = func(st *store.Store, accumulated time.Duration, segment time.Time) error {
+		once.Do(func() { close(started) })
+		<-release
+		return oldSave(st, accumulated, segment)
+	}
+	defer func() { saveOpenSegment = oldSave }()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		r.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("checkpoint did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("shutdown hung on checkpoint")
+	}
+	close(release)
+	time.Sleep(200 * time.Millisecond)
+}
+
+func TestStopDuringShutdownPersistsStopped(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	r.exited.Store(true)
+	if err := r.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Settings()
+	if err != nil || got.Running {
+		t.Fatalf("running=%v err=%v", got.Running, err)
+	}
+	r.Shutdown()
+}
+
+func TestShutdownTimeoutSkipsClosedStore(t *testing.T) {
+	old := shutdownLimit
+	shutdownLimit = 40 * time.Millisecond
+	defer func() { shutdownLimit = old }()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vanity.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytesKey()
+	priv := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	r := New(st, key, func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	r.HookSave(func([]byte, store.NewResult) (int64, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return 0, errors.New("closed")
+	})
+	go r.EnqueueHit("8A", 8, sum, lower, priv)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("save did not start")
+	}
+	done := make(chan struct{})
+	go func() {
+		r.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("shutdown hung")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	time.Sleep(200 * time.Millisecond)
+	st2, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	restored := New(st2, key, func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := restored.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	restored.syncFlush()
+	rows, err := st2.List("8A")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows %d err %v", len(rows), err)
+	}
+	restored.Shutdown()
+}
+
+func TestAbandonedHitDoesNotTouchStore(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key := bytesKey()
+	priv := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saves int
+	r := New(st, key, func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	r.HookSave(func([]byte, store.NewResult) (int64, error) {
+		saves++
+		return 0, errors.New("should not save")
+	})
+	r.abandoned.Store(true)
+	r.handle(event{hit: &hit{rule: "8A", length: 8, checksum: sum, lower: lower, privHex: priv}})
+	if saves != 0 {
+		t.Fatal("saved after abandon")
+	}
+	pending, err := os.ReadDir(filepath.Join(dir, "pending"))
+	if err != nil || len(pending) == 0 {
+		t.Fatalf("pending %v %v", pending, err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r.Shutdown()
+}
+
+func TestWipeFileOverwritesBeforeRemove(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.bin")
+	payload := []byte("private-key-material")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var saw []byte
+	old := removeFile
+	removeFile = func(name string) error {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		saw = append([]byte(nil), b...)
+		return os.Remove(name)
+	}
+	defer func() { removeFile = old }()
+	if err := wipeFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(saw, payload) || bytes.Contains(saw, []byte("private")) {
+		t.Fatalf("not overwritten: %q", saw)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file kept: %v", err)
+	}
+}
+
+func TestRemovePendingWipesBeforeUnlink(t *testing.T) {
+	dir := t.TempDir()
+	lower := "abcdef"
+	base := filepath.Join(dir, "pending")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(base, pendingName(lower))
+	if err := os.WriteFile(path, []byte("ciphertext-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var saw []byte
+	old := removeFile
+	removeFile = func(name string) error {
+		b, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		if !strings.HasSuffix(name, ".tmp") {
+			saw = append([]byte(nil), b...)
+		}
+		return os.Remove(name)
+	}
+	defer func() { removeFile = old }()
+	if err := removePending(dir, lower); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(saw, []byte("ciphertext")) {
+		t.Fatalf("pending unlinked with ciphertext: %q", saw)
+	}
+}
+
+func TestClearBrokenKeepsValidPending(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key := bytesKey()
+	r := New(st, key, func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	priv := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePending(dir, key, hit{rule: "8A", length: 8, checksum: sum, lower: lower, privHex: priv}); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(dir, "pending", "0123456789abcdef0123456789abcdef")
+	if err := os.WriteFile(broken, []byte("not-a-valid-box"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, err := r.ClearBroken()
+	if err != nil || n != 1 {
+		t.Fatalf("cleared %d %v", n, err)
+	}
+	if _, err := os.Stat(broken); !os.IsNotExist(err) {
+		t.Fatalf("broken kept: %v", err)
+	}
+	hits, brokenN, err := loadPending(dir, key)
+	if err != nil || brokenN != 0 || len(hits) != 1 {
+		t.Fatalf("hits %d broken %d err %v", len(hits), brokenN, err)
+	}
+	if r.Snapshot().Broken != 0 {
+		t.Fatal(r.Snapshot().Broken)
+	}
+	r.Shutdown()
+}
+
 func TestFailedSaveIsRetriedAndSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vanity.db")
@@ -325,6 +616,10 @@ func TestFailedSaveIsRetriedAndSurvivesRestart(t *testing.T) {
 	}
 	key := bytesKey()
 	priv := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var calls int
 	var logs []string
 	var mu sync.Mutex
@@ -345,7 +640,7 @@ func TestFailedSaveIsRetriedAndSurvivesRestart(t *testing.T) {
 	if err := r.Boot(); err != nil {
 		t.Fatal(err)
 	}
-	r.EnqueueHit("8A", 8, "0x1111111111111111111111111111111111111111", "1111111111111111111111111111111111111111", priv)
+	r.EnqueueHit("8A", 8, sum, lower, priv)
 	if r.Snapshot().Unsaved != 1 {
 		t.Fatalf("unsaved %d", r.Snapshot().Unsaved)
 	}
@@ -392,7 +687,12 @@ func TestFailedSaveIsRetriedAndSurvivesRestart(t *testing.T) {
 	if err := fail.Boot(); err != nil {
 		t.Fatal(err)
 	}
-	fail.EnqueueHit("1-8", 8, "0x2222222222222222222222222222222222222222", "2222222222222222222222222222222222222222", priv)
+	priv2 := "0000000000000000000000000000000000000000000000000000000000000002"
+	sum2, lower2, err := vanity.AddressFromPrivateKeyHex(priv2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail.EnqueueHit("1-8", 8, sum2, lower2, priv2)
 	if fail.Snapshot().Unsaved != 1 {
 		t.Fatalf("restart unsaved %d", fail.Snapshot().Unsaved)
 	}
@@ -461,6 +761,262 @@ func TestBrokenPendingIsNotCountedAsRetry(t *testing.T) {
 	r.syncFlush()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("broken file changed: %v", err)
+	}
+}
+
+func TestBootDoesNotCountCrashGap(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	past := time.Now().UTC().Add(-2 * time.Hour)
+	if err := st.MarkRunning(past); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetAttempts(99); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveOpenSegment(1500*time.Millisecond, past); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown()
+	snap := r.Snapshot()
+	settings, err := st.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Running || snap.Attempts != 99 {
+		t.Fatalf("resume %+v", snap)
+	}
+	if settings.Accumulated > 5*time.Second || snap.Runtime > 5*time.Second {
+		t.Fatalf("downtime counted snap=%s acc=%s", snap.Runtime, settings.Accumulated)
+	}
+	if settings.SegmentStarted.IsZero() || time.Since(settings.SegmentStarted) > time.Minute {
+		t.Fatalf("segment not restarted: %s", settings.SegmentStarted)
+	}
+}
+
+func TestShutdownFoldsRuntimeWithoutCountingDowntime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vanity.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	r.Shutdown()
+	settings, err := st.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.Running || settings.Accumulated < 20*time.Millisecond || !settings.SegmentStarted.IsZero() {
+		t.Fatalf("running=%v acc=%s segment=%v", settings.Running, settings.Accumulated, settings.SegmentStarted)
+	}
+	folded := settings.Accumulated
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	again := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := again.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	defer again.Shutdown()
+	settings, err = st.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Accumulated+5*time.Millisecond < folded || settings.Accumulated > folded+20*time.Millisecond {
+		t.Fatalf("folded=%s now=%s", folded, settings.Accumulated)
+	}
+}
+
+func TestValidTmpPendingIsImported(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	priv := "0000000000000000000000000000000000000000000000000000000000000001"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := hit{rule: "8A", length: 8, checksum: sum, lower: lower, privHex: priv}
+	if err := writePending(dir, bytesKey(), h); err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(dir, "pending", pendingName(lower))
+	if err := os.Rename(final, final+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	r.syncFlush()
+	r.Shutdown()
+	rows, err := st.List("8A")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows %d err %v", len(rows), err)
+	}
+	if _, err := os.Stat(final + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("tmp kept: %v", err)
+	}
+}
+
+func TestPartialTmpIsBrokenNotSilent(t *testing.T) {
+	dir := t.TempDir()
+	pending := filepath.Join(dir, "pending")
+	if err := os.MkdirAll(pending, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(pending, "0123456789abcdef0123456789abcdef.tmp")
+	if err := os.WriteFile(path, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown()
+	if r.Snapshot().Broken != 1 || r.Snapshot().Unsaved != 0 {
+		t.Fatalf("broken=%d unsaved=%d", r.Snapshot().Broken, r.Snapshot().Unsaved)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMismatchedPendingIsNotImported(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	priv := "0000000000000000000000000000000000000000000000000000000000000001"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := hit{rule: "8A", length: 8, checksum: sum, lower: lower, privHex: "0000000000000000000000000000000000000000000000000000000000000002"}
+	if err := writePending(dir, bytesKey(), bad); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	r.syncFlush()
+	r.Shutdown()
+	rows, err := st.List("8A")
+	if err != nil || len(rows) != 0 || r.Snapshot().Broken != 1 {
+		t.Fatalf("rows %d broken %d err %v", len(rows), r.Snapshot().Broken, err)
+	}
+}
+
+func TestDeleteRemovesPendingBeforeItCanReturn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vanity.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytesKey()
+	priv := "0000000000000000000000000000000000000000000000000000000000000001"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.SaveResult(key, store.NewResult{Rule: "8A", Length: 8, Checksum: sum, Lower: lower, PrivHex: priv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePending(dir, key, hit{rule: "8A", length: 8, checksum: sum, lower: lower, privHex: priv}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, key, func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.DeleteResult(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	again := New(st, key, func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := again.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	again.syncFlush()
+	again.Shutdown()
+	rows, err := st.List("8A")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rows %d err %v", len(rows), err)
+	}
+}
+
+func TestPendingRenameFailureRemovesTmp(t *testing.T) {
+	dir := t.TempDir()
+	priv := "0000000000000000000000000000000000000000000000000000000000000001"
+	sum, lower, err := vanity.AddressFromPrivateKeyHex(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(dir, "pending", pendingName(lower))
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = writePending(dir, bytesKey(), hit{rule: "8A", length: 8, checksum: sum, lower: lower, privHex: priv})
+	if err == nil {
+		t.Fatal("expected rename error")
+	}
+	if _, statErr := os.Stat(final + ".tmp"); !os.IsNotExist(statErr) {
+		t.Fatalf("tmp kept: %v", statErr)
 	}
 }
 

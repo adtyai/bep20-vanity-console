@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -92,6 +93,33 @@ func TestSecondOpenFailsWhileHeld(t *testing.T) {
 	}
 }
 
+func TestUnlinkLockFileDoesNotAllowSecondOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vanity.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := os.Remove(path + ".lock"); err != nil && !os.IsNotExist(err) {
+		if _, err2 := Open(path); err2 == nil || err2.Error() != "lock" {
+			t.Fatalf("remove=%v second=%v", err, err2)
+		}
+		return
+	}
+	if _, err := Open(path); err == nil || err.Error() != "lock" {
+		t.Fatalf("second open after unlink err=%v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Close()
+}
+
 func TestDeleteOverwritesCiphertext(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vanity.db")
@@ -136,6 +164,36 @@ func TestDeleteOverwritesCiphertext(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDeleteScrubFailureStillRemovesRow(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key := bytes.Repeat([]byte{9}, 32)
+	priv := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	id, err := st.SaveResult(key, NewResult{
+		Rule: "8A", Length: 8,
+		Checksum: "0x1111111111111111111111111111111111111111",
+		Lower:    "1111111111111111111111111111111111111111",
+		PrivHex:  priv,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := SetScrubHook(func(*sql.DB, string) error { return errors.New("vacuum") })
+	defer restore()
+	err = st.Delete(id)
+	if !errors.Is(err, ErrScrub) {
+		t.Fatalf("err %v", err)
+	}
+	_, err = st.Get(id)
+	if err == nil || err.Error() != "not_found" {
+		t.Fatalf("row still present: %v", err)
 	}
 }
 
