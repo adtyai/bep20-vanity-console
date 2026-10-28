@@ -1,0 +1,8 @@
+/data/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+secret.key.lock
+secret.key.tmp
+/bep20-vanity-console

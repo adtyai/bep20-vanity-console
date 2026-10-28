@@ -1,0 +1,30 @@
+{{define "head"}}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<title>{{.Title}}</title>
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/app.js" defer></script>
+{{if .Refresh}}<meta http-equiv="refresh" content="5">{{end}}
+</head>
+<body>
+<header><h1>BEP20 自用靓号台</h1></header>
+<main>
+{{end}}
+
+{{define "foot"}}
+</main>
+</body>
+</html>
+{{end}}
+
+{{define "error"}}
+{{template "head" .}}
+<p class="error">{{.Error}}</p>
+<p><a href="/login">返回登录</a></p>
+{{template "foot" .}}
+{{end}}

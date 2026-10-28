@@ -1,0 +1,79 @@
+{{define "home"}}
+{{template "head" .}}
+<section class="stats">
+  <div class="panel"><div class="muted">状态</div><strong>{{if .Running}}运行中{{else}}已停止{{end}}</strong></div>
+  <div class="panel"><div class="muted">已尝试</div><strong>{{.Attempts}}</strong></div>
+  <div class="panel"><div class="muted">速度</div><strong>{{.Speed}}</strong></div>
+  <div class="panel"><div class="muted">已运行</div><strong>{{.Runtime}}</strong></div>
+</section>
+<section class="panel">
+  <p class="muted">关闭浏览器不会停止。普通号不会保存。这是生成器，不负责收款。</p>
+  {{if .SaveWarning}}<p class="error">{{.SaveWarning}}</p>{{end}}
+  {{if .BrokenWarning}}<p class="error">{{.BrokenWarning}}</p>{{end}}
+  <div class="row">
+    {{if .Running}}
+    <form method="post" action="/stop">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button class="danger" type="submit">停止</button>
+    </form>
+    {{else}}
+    <form method="post" action="/start">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">开始生成</button>
+    </form>
+    {{end}}
+    <form method="post" action="/logout">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">退出</button>
+    </form>
+  </div>
+</section>
+<form class="panel" method="post" action="/cpu">
+  <h2>CPU 上限</h2>
+  <p class="muted">可设 5 到 95，默认 50。改完约 1 秒内生效。不允许 100。长时间高占用仍可能被机房当成持续高负载。</p>
+  <div class="row">
+    <input type="number" name="percent" min="5" max="95" required value="{{.CPU}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">保存</button>
+  </div>
+</form>
+<form class="panel" method="post" action="/rules">
+  <h2>规则</h2>
+  <p class="muted">关掉某一条只是不再保存新结果，任务继续，已有记录不删。</p>
+  {{range .Rules}}
+  <label><input type="checkbox" name="{{.Field}}" value="1" {{if .Enabled}}checked{{end}}> {{.Title}} {{.Note}}</label>
+  {{end}}
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button type="submit">保存规则</button>
+</form>
+<section class="grid">
+  {{range .Rules}}
+  <article class="card">
+    <h2>{{.Title}}</h2>
+    <p class="muted">{{.Note}}</p>
+    <p>上次命中：{{.Last}}</p>
+    <p>预计平均等待：{{.ETA}}</p>
+    {{if not .Rows}}<p class="muted">还没有</p>{{end}}
+    {{range .Rows}}
+    <div class="hit">
+      <p class="addr">{{.Head}}<span class="tail">{{.Tail}}</span></p>
+      <p class="muted">{{.LengthLabel}} · {{.Found}}</p>
+      <input id="addr-{{.ID}}" class="copy" readonly spellcheck="false" value="{{.Checksum}}">
+      <div class="row">
+        <button type="button" data-copy="addr-{{.ID}}">复制地址</button>
+        <form method="post" action="/results/{{.ID}}/reveal">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button type="submit">显示私钥</button>
+        </form>
+        <form method="post" action="/results/{{.ID}}/delete">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <button class="danger" type="submit">删除</button>
+        </form>
+      </div>
+    </div>
+    {{end}}
+  </article>
+  {{end}}
+</section>
+{{template "foot" .}}
+{{end}}

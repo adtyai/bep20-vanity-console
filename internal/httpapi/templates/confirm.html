@@ -1,0 +1,14 @@
+{{define "confirm"}}
+{{template "head" .}}
+<form class="panel" method="post" action="{{.Action}}">
+  <h2>请再确认一次</h2>
+  <p>{{.Message}}</p>
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="confirm" value="yes">
+  <div class="row">
+    <button class="danger" type="submit">确认</button>
+    <a href="/">返回</a>
+  </div>
+</form>
+{{template "foot" .}}
+{{end}}

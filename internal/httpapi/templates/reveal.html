@@ -1,0 +1,15 @@
+{{define "reveal"}}
+{{template "head" .}}
+<section class="panel">
+  <h2>私钥</h2>
+  <p class="muted">{{.LengthLabel}} · {{.Found}}</p>
+  <p class="addr">{{.AddressHead}}<span class="tail">{{.AddressTail}}</span></p>
+  <label>地址<input id="addr" class="copy" readonly spellcheck="false" value="{{.Address}}"></label>
+  <div class="row"><button type="button" data-copy="addr">复制地址</button></div>
+  <label>私钥<input id="priv" class="copy" readonly autocomplete="off" spellcheck="false" autocapitalize="off" value="{{.Priv}}"></label>
+  <div class="row"><button type="button" data-copy="priv">复制私钥</button></div>
+  <p class="muted">导入钱包后，先核对地址与本页一致。这是生成器，不负责收款。</p>
+  <p><a href="/">返回</a></p>
+</section>
+{{template "foot" .}}
+{{end}}

@@ -1,0 +1,146 @@
+name: Publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+  prepare:
+    name: Prepare tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve version
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=main-$(date -u +'%Y%m%d')-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+  build_single_arch:
+    name: Build & push (${{ matrix.arch }})
+    needs: [test, prepare]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/adtyai/bep20-vanity-console
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ghcr.io/adtyai/bep20-vanity-console:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            ghcr.io/adtyai/bep20-vanity-console:main-${{ matrix.arch }}
+            ghcr.io/adtyai/bep20-vanity-console:latest-${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image with cosign
+        run: cosign sign --yes ghcr.io/adtyai/bep20-vanity-console@${{ steps.build.outputs.digest }}
+
+  create_manifests:
+    name: Create multi-arch manifests
+    needs: [prepare, build_single_arch]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifests
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          for name in latest main "$VERSION"; do
+            docker buildx imagetools create \
+              -t "ghcr.io/adtyai/bep20-vanity-console:${name}" \
+              "ghcr.io/adtyai/bep20-vanity-console:${name}-amd64" \
+              "ghcr.io/adtyai/bep20-vanity-console:${name}-arm64"
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign manifests
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cosign sign --yes ghcr.io/adtyai/bep20-vanity-console:latest
+          cosign sign --yes ghcr.io/adtyai/bep20-vanity-console:main
+          cosign sign --yes "ghcr.io/adtyai/bep20-vanity-console:${VERSION}"
+
+# adtyai: ensure workflow registered
