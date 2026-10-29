@@ -2,6 +2,7 @@ package job
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"runtime"
 	"sync"
@@ -65,6 +66,7 @@ type Runner struct {
 	store *store.Store
 	key   []byte
 	gen   GenerateFunc
+	fast  bool
 	logf  Logger
 
 	cpu       atomic.Int32
@@ -122,6 +124,7 @@ type ruleSnap struct {
 }
 
 func New(st *store.Store, key []byte, gen GenerateFunc, workers int, logf Logger) *Runner {
+	fast := gen == nil
 	if gen == nil {
 		gen = vanity.Generate
 	}
@@ -140,6 +143,7 @@ func New(st *store.Store, key []byte, gen GenerateFunc, workers int, logf Logger
 		store:        st,
 		key:          key,
 		gen:          gen,
+		fast:         fast,
 		logf:         logf,
 		rules:        map[string]bool{"8A": true, "9A": true, "1-8": true, "1-9": true},
 		workers:      workers,
@@ -417,6 +421,14 @@ func (r *Runner) Snapshot() Snapshot {
 }
 
 func (r *Runner) loop(i int) {
+	var src *vanity.KeySource
+	if r.fast {
+		var err error
+		src, err = vanity.NewKeySource()
+		if err != nil {
+			r.logf("error", "", 0, 0, "generate")
+		}
+	}
 	for {
 		if r.exited.Load() {
 			return
@@ -434,7 +446,21 @@ func (r *Runner) loop(i int) {
 			r.busy[i].Store(0)
 			continue
 		}
-		r.oneKey()
+		if r.fast {
+			if src == nil {
+				var err error
+				src, err = vanity.NewKeySource()
+				if err != nil {
+					r.logf("error", "", 0, 0, "generate")
+					time.Sleep(20 * time.Millisecond)
+					r.busy[i].Store(0)
+					continue
+				}
+			}
+			r.oneKeyFast(src)
+		} else {
+			r.oneKey()
+		}
 		r.busy[i].Store(0)
 	}
 }
@@ -487,6 +513,43 @@ func (r *Runner) wakeCores() {
 
 func (r *Runner) Key() []byte {
 	return bytes.Clone(r.key)
+}
+
+func (r *Runner) oneKeyFast(src *vanity.KeySource) {
+	var priv [32]byte
+	addr, ok, err := src.Next(&priv)
+	if err != nil {
+		r.logf("error", "", 0, 0, "generate")
+		time.Sleep(20 * time.Millisecond)
+		return
+	}
+	if !ok {
+		return
+	}
+	r.attempts.Add(1)
+	got, ok := vanity.ClassifyAddress(addr)
+	if !ok || !r.enabled()[got.Rule] {
+		return
+	}
+	privHex := hex.EncodeToString(priv[:])
+	derived, derivedLower, err := vanity.AddressFromPrivateKeyHex(privHex)
+	if err != nil || hex.EncodeToString(addr[:]) != derivedLower {
+		r.logf("error", "", 0, 0, "address_mismatch")
+		return
+	}
+	h := hit{
+		rule:     got.Rule,
+		length:   got.Length,
+		checksum: derived,
+		lower:    derivedLower,
+		privHex:  privHex,
+	}
+	r.stamp(&h)
+	if r.abandoned.Load() {
+		r.keepPending(h)
+		return
+	}
+	r.events <- event{hit: &h}
 }
 
 func (r *Runner) oneKey() {
