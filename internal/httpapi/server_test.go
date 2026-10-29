@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"html/template"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -729,6 +730,48 @@ func TestDeleteScrubFailureIsNotHTTP500(t *testing.T) {
 	h.logMu.Unlock()
 	if !strings.Contains(joined, "scrub") || strings.Contains(joined, knownKey) {
 		t.Fatalf("scrub log missing or leaked: %s", joined)
+	}
+}
+
+func TestHomeExplainsProbedCPUs(t *testing.T) {
+	b, err := embedded.ReadFile("templates/home.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(b)
+	for _, banned := range []string{"两颗物理", "面板上的 90%"} {
+		if strings.Contains(page, banned) {
+			t.Fatalf("home still says %q", banned)
+		}
+	}
+	if !strings.Contains(page, "当前可用 {{.UsableCPUs}} 个逻辑核") {
+		t.Fatal("home does not show probed usable CPUs")
+	}
+	for _, need := range []string{"容器配额不足 1 个逻辑核", "容器配额不到 1%", "没有读到容器 CPU 配额"} {
+		if !strings.Contains(page, need) {
+			t.Fatalf("home does not warn about quota cap %q", need)
+		}
+	}
+}
+
+func TestHomeRendersUnreadQuota(t *testing.T) {
+	tmpl, err := template.ParseFS(embedded, "templates/*.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&buf, "home", view{QuotaUnknown: true, UsableCPUs: 40, HostCPUs: 40, CPU: 90}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "没有读到容器 CPU 配额") {
+		t.Fatal("unread quota was not rendered")
+	}
+	buf.Reset()
+	if err := tmpl.ExecuteTemplate(&buf, "home", view{UsableCPUs: 40, HostCPUs: 40, CPU: 90}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "没有读到容器 CPU 配额") {
+		t.Fatal("warned without an unread quota")
 	}
 }
 

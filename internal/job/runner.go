@@ -3,7 +3,6 @@ package job
 import (
 	"bytes"
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,20 +23,24 @@ var saveOpenSegment = func(st *store.Store, accumulated time.Duration, segment t
 }
 
 type Snapshot struct {
-	Running   bool
-	Exiting   bool
-	Stoppable bool
-	CPU       int
-	Attempts  uint64
-	PerSecond float64
-	HaveSpeed bool
-	Stuck     bool
-	Runtime   time.Duration
-	Rules     map[string]bool
-	Observed  time.Duration
-	SegmentOn bool
-	Unsaved   int
-	Broken    int
+	Running      bool
+	Exiting      bool
+	Stoppable    bool
+	CPU          int
+	HostCPUs     int
+	UsableCPUs   int
+	DutyCap      int
+	QuotaUnknown bool
+	Attempts     uint64
+	PerSecond    float64
+	HaveSpeed    bool
+	Stuck        bool
+	Runtime      time.Duration
+	Rules        map[string]bool
+	Observed     time.Duration
+	SegmentOn    bool
+	Unsaved      int
+	Broken       int
 }
 
 type hit struct {
@@ -76,8 +79,12 @@ type Runner struct {
 	sampleMu sync.Mutex
 	samples  []sample
 
-	workers int
-	busy    []atomic.Int32
+	workers      int
+	hostCPUs     int
+	usableCPUs   int
+	dutyCap      int
+	quotaUnknown bool
+	busy         []atomic.Int32
 
 	events     chan event
 	writerStop chan struct{}
@@ -106,23 +113,32 @@ func New(st *store.Store, key []byte, gen GenerateFunc, workers int, logf Logger
 	if gen == nil {
 		gen = vanity.Generate
 	}
-	if workers < 1 {
-		workers = runtime.NumCPU()
-	}
 	if logf == nil {
 		logf = func(string, string, int64, uint64, string) {}
 	}
+	host, usable, dutyCap := 0, 0, 0
+	var quotaUnknown bool
+	if workers < 1 {
+		workers, host, usable, dutyCap, quotaUnknown = startHostWorkers(logf)
+	}
+	if workers < 1 {
+		workers = 1
+	}
 	r := &Runner{
-		store:      st,
-		key:        key,
-		gen:        gen,
-		logf:       logf,
-		rules:      map[string]bool{"8A": true, "9A": true, "1-8": true, "1-9": true},
-		workers:    workers,
-		busy:       make([]atomic.Int32, workers),
-		events:     make(chan event, 1024),
-		writerStop: make(chan struct{}),
-		observedAt: time.Now(),
+		store:        st,
+		key:          key,
+		gen:          gen,
+		logf:         logf,
+		rules:        map[string]bool{"8A": true, "9A": true, "1-8": true, "1-9": true},
+		workers:      workers,
+		hostCPUs:     host,
+		usableCPUs:   usable,
+		dutyCap:      dutyCap,
+		quotaUnknown: quotaUnknown,
+		busy:         make([]atomic.Int32, workers),
+		events:       make(chan event, 1024),
+		writerStop:   make(chan struct{}),
+		observedAt:   time.Now(),
 	}
 	r.cpu.Store(50)
 	return r
@@ -353,20 +369,24 @@ func (r *Runner) Snapshot() Snapshot {
 	}
 	per, have, stuck := r.speed(time.Now(), running, observed)
 	return Snapshot{
-		Running:   running,
-		Exiting:   exiting,
-		Stoppable: stoppable,
-		CPU:       int(r.cpu.Load()),
-		Attempts:  r.attempts.Load(),
-		PerSecond: per,
-		HaveSpeed: have,
-		Stuck:     stuck,
-		Runtime:   runtime,
-		Rules:     rules,
-		Observed:  observed,
-		SegmentOn: running,
-		Unsaved:   r.unsaved(),
-		Broken:    int(r.broken.Load()),
+		Running:      running,
+		Exiting:      exiting,
+		Stoppable:    stoppable,
+		CPU:          int(r.cpu.Load()),
+		HostCPUs:     r.hostCPUs,
+		UsableCPUs:   r.usableCPUs,
+		DutyCap:      r.dutyCap,
+		QuotaUnknown: r.quotaUnknown,
+		Attempts:     r.attempts.Load(),
+		PerSecond:    per,
+		HaveSpeed:    have,
+		Stuck:        stuck,
+		Runtime:      runtime,
+		Rules:        rules,
+		Observed:     observed,
+		SegmentOn:    running,
+		Unsaved:      r.unsaved(),
+		Broken:       int(r.broken.Load()),
 	}
 }
 
@@ -379,12 +399,10 @@ func (r *Runner) loop(i int) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
-		percent := int(r.cpu.Load())
-		if percent < 5 {
-			percent = 5
-		}
-		if percent > 95 {
-			percent = 95
+		percent := clampDuty(int(r.cpu.Load()), r.dutyCap)
+		if percent < 1 {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 		work := time.Duration(percent) * time.Millisecond
 		rest := time.Duration(100-percent) * time.Millisecond

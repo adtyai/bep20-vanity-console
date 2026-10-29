@@ -42,6 +42,10 @@ type view struct {
 	Exiting       bool
 	Stoppable     bool
 	CPU           int
+	HostCPUs      int
+	UsableCPUs    int
+	DutyCap       int
+	QuotaUnknown  bool
 	Attempts      uint64
 	Speed         string
 	Runtime       string
@@ -443,6 +447,10 @@ func (s *Server) renderHome(w http.ResponseWriter, sess auth.Session) {
 		Exiting:       snap.Exiting,
 		Stoppable:     snap.Stoppable,
 		CPU:           snap.CPU,
+		HostCPUs:      snap.HostCPUs,
+		UsableCPUs:    snap.UsableCPUs,
+		DutyCap:       snap.DutyCap,
+		QuotaUnknown:  snap.QuotaUnknown,
 		Attempts:      snap.Attempts,
 		Speed:         speedText(snap),
 		Runtime:       runtimeText(snap.Runtime),
