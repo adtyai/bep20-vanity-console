@@ -1092,6 +1092,25 @@ func TestSetRulesPublishesWithoutLockingHotPath(t *testing.T) {
 	}
 }
 
+func TestApplyCoreLimitUsesNinetyFivePercentOfTheMachine(t *testing.T) {
+	r := New(nil, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 40, nil)
+	r.hostCPUs = 40
+	r.usableCPUs = 40
+	r.cpu.Store(95)
+	var got int
+	old := setMaxProcs
+	setMaxProcs = func(n int) int {
+		got = n
+		return n
+	}
+	defer func() { setMaxProcs = old }()
+	if n := r.applyCoreLimit(); n != 38 || got != 38 || int(r.coreLimit.Load()) != 38 {
+		t.Fatalf("limit = %d procs = %d stored = %d, want 38", n, got, r.coreLimit.Load())
+	}
+}
+
 func TestBootWritesBackCPUAbove95(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "vanity.db"))

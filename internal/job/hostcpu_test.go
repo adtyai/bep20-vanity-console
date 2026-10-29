@@ -234,6 +234,21 @@ func TestLiveCgroupPathIfPresent(t *testing.T) {
 	t.Logf("cgroup v%d dir %s", version, dir)
 }
 
+func TestMachineCoresUsesHostPercentWithoutSleep(t *testing.T) {
+	if n := machineCores(40, 40, 95); n != 38 {
+		t.Fatalf("40 cores at 95 = %d, want 38", n)
+	}
+	if n := machineCores(40, 40, 50); n != 20 {
+		t.Fatalf("40 cores at 50 = %d, want 20", n)
+	}
+	if n := machineCores(40, 8, 95); n != 8 {
+		t.Fatalf("usable cap = %d, want 8", n)
+	}
+	if n := machineCores(1, 1, 95); n != 1 {
+		t.Fatalf("one core = %d, want 1", n)
+	}
+}
+
 func TestLogicalCPUsFallbackWhenListsEmpty(t *testing.T) {
 	ids := chooseLogicalCPUs("", "cpu  1 0 0 0\n", 4)
 	if len(ids) != 4 {

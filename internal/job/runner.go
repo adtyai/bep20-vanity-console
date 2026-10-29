@@ -3,6 +3,7 @@ package job
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,8 @@ type GenerateFunc func() (privHex, checksum, lower string, err error)
 type Logger func(event, rule string, id int64, count uint64, errorType string)
 
 var shutdownLimit = 8 * time.Second
+
+var setMaxProcs = runtime.GOMAXPROCS
 
 var saveOpenSegment = func(st *store.Store, accumulated time.Duration, segment time.Time) error {
 	return st.SaveOpenSegment(accumulated, segment)
@@ -85,6 +88,9 @@ type Runner struct {
 	usableCPUs   int
 	dutyCap      int
 	quotaUnknown bool
+	coreLimit    atomic.Int32
+	coreMu       sync.Mutex
+	coreCond     *sync.Cond
 	busy         []atomic.Int32
 
 	events     chan event
@@ -147,6 +153,7 @@ func New(st *store.Store, key []byte, gen GenerateFunc, workers int, logf Logger
 		observedAt:   time.Now(),
 	}
 	r.cpu.Store(50)
+	r.coreCond = sync.NewCond(&r.coreMu)
 	r.publishRules(r.rules)
 	return r
 }
@@ -190,6 +197,7 @@ func (r *Runner) Boot() error {
 	} else {
 		r.mu.Unlock()
 	}
+	r.applyCoreLimit()
 	r.loopOnce.Do(func() {
 		r.writerWG.Add(1)
 		go r.writer()
@@ -220,6 +228,7 @@ func (r *Runner) Start() error {
 	r.samples = nil
 	r.sampleMu.Unlock()
 	r.running.Store(true)
+	r.wakeCores()
 	return nil
 }
 
@@ -258,6 +267,7 @@ func (r *Runner) Stop() error {
 	}
 	r.mu.Unlock()
 	r.running.Store(false)
+	r.wakeCores()
 	r.stateMu.Unlock()
 	r.waitIdle()
 	r.syncFlush()
@@ -287,6 +297,7 @@ func (r *Runner) shutdownWithin(limit time.Duration) {
 		}
 		r.exited.Store(true)
 		r.running.Store(false)
+		r.wakeCores()
 		r.stateMu.Unlock()
 		r.waitIdle()
 		if !r.abandoned.Load() {
@@ -328,6 +339,7 @@ func (r *Runner) SetCPU(n int) error {
 		return err
 	}
 	r.cpu.Store(int32(n))
+	r.applyCoreLimit()
 	return nil
 }
 
@@ -413,30 +425,64 @@ func (r *Runner) loop(i int) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
-		percent := clampDuty(int(r.cpu.Load()), r.dutyCap)
-		if percent < 1 {
-			time.Sleep(100 * time.Millisecond)
+		if i >= int(r.coreLimit.Load()) {
+			r.waitForCores(i)
 			continue
 		}
-		work := time.Duration(percent) * time.Millisecond
-		rest := time.Duration(100-percent) * time.Millisecond
-		end := time.Now().Add(work)
-		for time.Now().Before(end) {
-			if r.exited.Load() || !r.running.Load() {
-				break
-			}
-			r.busy[i].Store(1)
-			if r.exited.Load() || !r.running.Load() {
-				r.busy[i].Store(0)
-				break
-			}
-			r.oneKey()
+		r.busy[i].Store(1)
+		if r.exited.Load() || !r.running.Load() {
 			r.busy[i].Store(0)
+			continue
 		}
-		if rest > 0 && r.running.Load() && !r.exited.Load() {
-			time.Sleep(rest)
-		}
+		r.oneKey()
+		r.busy[i].Store(0)
 	}
+}
+
+func (r *Runner) applyCoreLimit() int {
+	percent := clampDuty(int(r.cpu.Load()), r.dutyCap)
+	usable := r.usableCPUs
+	if usable < 1 {
+		usable = r.workers
+	}
+	n := usable
+	if r.hostCPUs > 0 {
+		n = machineCores(r.hostCPUs, usable, percent)
+	}
+	if n > r.workers {
+		n = r.workers
+	}
+	if n < 1 {
+		n = 1
+	}
+	prev := r.coreLimit.Swap(int32(n))
+	if prev != int32(n) && r.hostCPUs > 0 {
+		setMaxProcs(n)
+	}
+	if prev != int32(n) {
+		r.wakeCores()
+	}
+	return n
+}
+
+func (r *Runner) waitForCores(i int) {
+	if r.coreCond == nil {
+		return
+	}
+	r.coreMu.Lock()
+	defer r.coreMu.Unlock()
+	for int(r.coreLimit.Load()) <= i && r.running.Load() && !r.exited.Load() {
+		r.coreCond.Wait()
+	}
+}
+
+func (r *Runner) wakeCores() {
+	if r.coreCond == nil {
+		return
+	}
+	r.coreMu.Lock()
+	r.coreCond.Broadcast()
+	r.coreMu.Unlock()
 }
 
 func (r *Runner) Key() []byte {

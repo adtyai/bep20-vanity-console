@@ -176,6 +176,31 @@ func overrideRuntimeProcs(readOK bool) bool {
 	return readOK
 }
 
+// machineCores 是整机按百分比一直占用的逻辑核数，不用休眠去凑。
+// 40 核的 95% 是 38。用不了那么多核时，停在实际可用数。
+func machineCores(host, usable, percent int) int {
+	if usable < 1 {
+		usable = 1
+	}
+	if host < 1 {
+		return usable
+	}
+	if percent < 1 {
+		return 1
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	n := host * percent / 100
+	if n < 1 {
+		n = 1
+	}
+	if n > usable {
+		n = usable
+	}
+	return n
+}
+
 func clampDuty(percent, dutyCap int) int {
 	if percent < config.MinCPU {
 		percent = config.MinCPU
