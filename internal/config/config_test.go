@@ -60,12 +60,12 @@ func TestLoadRejectsNonLoopback(t *testing.T) {
 }
 
 func TestValidateCPU(t *testing.T) {
-	for _, n := range []int{0, 4, 96, 100, -1} {
+	for _, n := range []int{0, 4, 201, -1} {
 		if err := ValidateCPU(n); err == nil {
 			t.Fatalf("%d should fail", n)
 		}
 	}
-	for _, n := range []int{5, 50, 95} {
+	for _, n := range []int{5, 50, 95, 100, 200} {
 		if err := ValidateCPU(n); err != nil {
 			t.Fatalf("%d should pass: %v", n, err)
 		}

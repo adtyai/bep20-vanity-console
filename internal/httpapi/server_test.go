@@ -273,7 +273,7 @@ func TestCPUBoundsStopConfirmAndRules(t *testing.T) {
 	h := newHarness(t)
 	h.createAdmin()
 	h.login()
-	for _, n := range []string{"0", "96", "100"} {
+	for _, n := range []string{"0", "4", "201"} {
 		csrf, _ := h.home()
 		res := h.c.do(http.MethodPost, "/cpu", url.Values{"csrf": {csrf}, "percent": {n}}.Encode())
 		body := readBody(t, res)
@@ -281,7 +281,7 @@ func TestCPUBoundsStopConfirmAndRules(t *testing.T) {
 			t.Fatalf("cpu %s -> %d %s", n, res.StatusCode, body)
 		}
 	}
-	for _, n := range []int{50, 95} {
+	for _, n := range []int{50, 95, 100, 200} {
 		csrf, _ := h.home()
 		res := h.c.do(http.MethodPost, "/cpu", url.Values{"csrf": {csrf}, "percent": {strconv.Itoa(n)}}.Encode())
 		if res.StatusCode != http.StatusSeeOther {

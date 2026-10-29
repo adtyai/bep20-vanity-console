@@ -178,8 +178,8 @@ func clampDuty(percent, dutyCap int) int {
 	if percent < 5 {
 		percent = 5
 	}
-	if percent > 95 {
-		percent = 95
+	if percent > 200 {
+		percent = 200
 	}
 	if dutyCap < 0 {
 		return 0
