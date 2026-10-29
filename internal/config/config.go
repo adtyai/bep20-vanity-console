@@ -57,9 +57,25 @@ func validateListen(listen string) error {
 	return nil
 }
 
+const (
+	MinCPU = 5
+	MaxCPU = 95
+)
+
 func ValidateCPU(n int) error {
-	if n < 5 || n > 500 {
+	if n < MinCPU || n > MaxCPU {
 		return ErrCPU
 	}
 	return nil
+}
+
+// ClampStoredCPU 把已经落库的值收进当前范围。高于上限的改成上限，低于下限的不装入。
+func ClampStoredCPU(n int) (int, bool) {
+	if n > MaxCPU {
+		n = MaxCPU
+	}
+	if ValidateCPU(n) != nil {
+		return 0, false
+	}
+	return n, true
 }

@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"bep20-vanity-console/internal/config"
 )
 
 func usableCapacity(detected, affinity, cgroupLimit, visible int, affinityOK bool) int {
@@ -175,11 +177,11 @@ func overrideRuntimeProcs(readOK bool) bool {
 }
 
 func clampDuty(percent, dutyCap int) int {
-	if percent < 5 {
-		percent = 5
+	if percent < config.MinCPU {
+		percent = config.MinCPU
 	}
-	if percent > 500 {
-		percent = 500
+	if percent > config.MaxCPU {
+		percent = config.MaxCPU
 	}
 	if dutyCap < 0 {
 		return 0

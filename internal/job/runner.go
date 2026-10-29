@@ -72,6 +72,7 @@ type Runner struct {
 
 	mu           sync.Mutex
 	rules        map[string]bool
+	rulesSnap    atomic.Pointer[ruleSnap]
 	accumulated  time.Duration
 	segmentStart time.Time
 	observedAt   time.Time
@@ -109,6 +110,11 @@ type sample struct {
 	n  uint64
 }
 
+// ruleSnap 发布后不再改。热路径只读。
+type ruleSnap struct {
+	rules map[string]bool
+}
+
 func New(st *store.Store, key []byte, gen GenerateFunc, workers int, logf Logger) *Runner {
 	if gen == nil {
 		gen = vanity.Generate
@@ -141,6 +147,7 @@ func New(st *store.Store, key []byte, gen GenerateFunc, workers int, logf Logger
 		observedAt:   time.Now(),
 	}
 	r.cpu.Store(50)
+	r.publishRules(r.rules)
 	return r
 }
 
@@ -158,11 +165,17 @@ func (r *Runner) Boot() error {
 	if err != nil {
 		return err
 	}
-	if err := config.ValidateCPU(st.CPU); err == nil {
-		r.cpu.Store(int32(st.CPU))
+	if cpu, ok := config.ClampStoredCPU(st.CPU); ok {
+		if cpu != st.CPU {
+			if err := r.store.SetCPU(cpu); err != nil {
+				return err
+			}
+		}
+		r.cpu.Store(int32(cpu))
 	}
 	r.mu.Lock()
 	r.rules = copyRules(st.Rules)
+	r.publishRules(r.rules)
 	r.accumulated = st.Accumulated
 	r.attempts.Store(st.Attempts)
 	if st.Running {
@@ -327,6 +340,7 @@ func (r *Runner) SetRules(rules map[string]bool) error {
 	}
 	r.mu.Lock()
 	r.rules = next
+	r.publishRules(next)
 	r.mu.Unlock()
 	return nil
 }
@@ -462,9 +476,15 @@ func (r *Runner) oneKey() {
 }
 
 func (r *Runner) enabled() map[string]bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return copyRules(r.rules)
+	snap := r.rulesSnap.Load()
+	if snap == nil || snap.rules == nil {
+		return copyRules(nil)
+	}
+	return snap.rules
+}
+
+func (r *Runner) publishRules(rules map[string]bool) {
+	r.rulesSnap.Store(&ruleSnap{rules: rules})
 }
 
 func (r *Runner) writer() {

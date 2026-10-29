@@ -251,7 +251,7 @@ func TestSetRulesDoesNotApplyWhenStoreFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected store error")
 	}
-	if !r.Snapshot().Rules["8A"] {
+	if !r.Snapshot().Rules["8A"] || !r.enabled()["8A"] {
 		t.Fatal("rule changed after store failure")
 	}
 	r.Shutdown()
@@ -1028,4 +1028,110 @@ func TestZeroSpeedIsStuck(t *testing.T) {
 	if per != 0 || !have || !stuck {
 		t.Fatalf("per=%v have=%v stuck=%v", per, have, stuck)
 	}
+}
+
+func TestEnabledDoesNotWaitOnRunnerLock(t *testing.T) {
+	r := New(nil, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got := enabledWithoutLock(t, r)
+	if !got["8A"] || !got["9A"] || !got["1-8"] || !got["1-9"] {
+		t.Fatalf("default rules %+v", got)
+	}
+}
+
+func TestBootPublishesRulesWithoutLockingHotPath(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SetRules(map[string]bool{"8A": false, "9A": true, "1-8": false, "1-9": true}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got := enabledWithoutLock(t, r)
+	if got["8A"] || !got["9A"] || got["1-8"] || !got["1-9"] {
+		t.Fatalf("published %+v", got)
+	}
+}
+
+func TestSetRulesPublishesWithoutLockingHotPath(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown()
+	if err := r.SetRules(map[string]bool{"8A": false, "9A": true, "1-8": false, "1-9": true}); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got := enabledWithoutLock(t, r)
+	if got["8A"] || !got["9A"] || got["1-8"] || !got["1-9"] {
+		t.Fatalf("published %+v", got)
+	}
+}
+
+func TestBootWritesBackCPUAbove95(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "vanity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SetCPU(500); err != nil {
+		t.Fatal(err)
+	}
+	r := New(st, bytesKey(), func() (string, string, string, error) {
+		return "", "", "", errStop
+	}, 1, nil)
+	if err := r.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown()
+	if r.Snapshot().CPU != 95 {
+		t.Fatalf("cpu = %d, want 95", r.Snapshot().CPU)
+	}
+	settings, err := st.Settings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.CPU != 95 {
+		t.Fatalf("stored cpu = %d, want 95", settings.CPU)
+	}
+}
+
+func enabledWithoutLock(t *testing.T, r *Runner) map[string]bool {
+	t.Helper()
+	done := make(chan map[string]bool, 1)
+	go func() {
+		done <- r.enabled()
+	}()
+	select {
+	case got := <-done:
+		return got
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("enabled waited on r.mu")
+	}
+	return nil
 }
