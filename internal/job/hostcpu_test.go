@@ -200,8 +200,8 @@ func TestClampDutyDoesNotExceedSubOneQuota(t *testing.T) {
 	if n := clampDuty(90, 0); n != 90 {
 		t.Fatalf("no cap = %d, want 90", n)
 	}
-	if n := clampDuty(200, 0); n != 200 {
-		t.Fatalf("full duty = %d, want 200", n)
+	if n := clampDuty(500, 0); n != 500 {
+		t.Fatalf("full duty = %d, want 500", n)
 	}
 	if n := clampDuty(90, -1); n != 0 {
 		t.Fatalf("empty quota = %d, want 0", n)

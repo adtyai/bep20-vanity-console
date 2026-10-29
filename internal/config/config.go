@@ -58,7 +58,7 @@ func validateListen(listen string) error {
 }
 
 func ValidateCPU(n int) error {
-	if n < 5 || n > 200 {
+	if n < 5 || n > 500 {
 		return ErrCPU
 	}
 	return nil

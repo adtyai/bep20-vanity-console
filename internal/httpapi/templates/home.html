@@ -39,7 +39,7 @@
 </section>
 <form class="panel" method="post" action="/cpu">
   <h2>CPU 上限</h2>
-  <p class="muted">可设 5 到 200，默认 50。程序先检查当前能用的逻辑核，再按这个百分比使用它们。90 表示把当前可用核用到大约 90%，不是单核 90%，也不保证机房面板等于 90。100 及以上不再主动休眠，也不会因此用到更多核。机器限制变化后要重启才会重新检查。改完约 1 秒内生效。长时间高占用仍可能被机房当成持续高负载。</p>
+  <p class="muted">可设 5 到 500，默认 50。程序先检查当前能用的逻辑核，再按这个百分比使用它们。90 表示把当前可用核用到大约 90%，不是单核 90%，也不保证机房面板等于 90。100 及以上不再主动休眠，也不会因此用到更多核。机器限制变化后要重启才会重新检查。改完约 1 秒内生效。长时间高占用仍可能被机房当成持续高负载。</p>
   {{if gt .UsableCPUs 0}}
   <p class="muted">当前可用 {{.UsableCPUs}} 个逻辑核。</p>
   {{end}}
@@ -55,7 +55,7 @@
   <p class="muted">容器配额不足 1 个逻辑核，实际不会超过 {{.DutyCap}}%。面板不会等于填写值。</p>
   {{end}}
   <div class="row">
-    <input type="number" name="percent" min="5" max="200" required value="{{.CPU}}">
+    <input type="number" name="percent" min="5" max="500" required value="{{.CPU}}">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <button type="submit">保存</button>
   </div>
